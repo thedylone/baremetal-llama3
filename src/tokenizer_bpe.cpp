@@ -138,6 +138,7 @@ string BPETokenizer::b64decode(const string &s) {
 vector<int> BPETokenizer::encode_impl(const string &text,
                                       bool enable_merge) const {
     vector<int> ids;
+    ids.emplace_back(bos_id_);  // Always add BOS token at the beginning
     size_t i = 0, n = text.size();
 
     while (i < n) {
@@ -194,9 +195,24 @@ vector<int> BPETokenizer::encode_chunk(const string &s,
     if (enable_merge) {
         while (true) {
             int best = INT_MAX;
-            throw runtime_error("Not implemented: you need to implement the BPE merge algorithm here");
-            // YOUR CODE HERE
+            int best_idx = -1;
             // Find the best pair to merge using pair_rank function
+            for (int i = 0; i < static_cast<int>(toks.size()) - 1; i++) {
+                int rank_val = pair_rank(toks[i], toks[i + 1]);
+                if (rank_val < best) {
+                    best = rank_val;
+                    best_idx = i;
+                }
+            }
+            
+            // If no valid merge found, break
+            if (best == INT_MAX) {
+                break;
+            }
+            
+            // Merge the best pair
+            toks[best_idx] = toks[best_idx] + toks[best_idx + 1];
+            toks.erase(toks.begin() + best_idx + 1);
         }
     }
 
