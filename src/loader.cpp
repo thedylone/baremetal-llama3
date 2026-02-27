@@ -43,6 +43,12 @@ struct TensorInfo {
   std::shared_ptr<MappedFile> mapped_file;
 };
 
+class LoaderException : public std::runtime_error {
+ public:
+  explicit LoaderException(const std::string& message)
+      : std::runtime_error(message) {}
+};
+
 /// @brief Implementation details for the LlamaDumpLoader class.
 class LlamaDumpLoader::Impl {
  public:
@@ -144,13 +150,13 @@ size_t LlamaDumpLoader::vocab_size(const std::string& dump_path,
   TensorInfo tensor_info;
   std::string embedding_file = dump_path + "/model_embed_tokens_weight.bin";
   if (!pImpl_->load_tensor(embedding_file, tensor_info))
-    throw std::runtime_error("Failed to load embedding tensor");
+    throw LoaderException("Failed to load embedding tensor");
   if (tensor_info.shape.size() != 2)
-    throw std::runtime_error("Expected 2D embedding tensor");
+    throw LoaderException("Expected 2D embedding tensor");
   pImpl_->vocab_size = tensor_info.shape[0];
   pImpl_->embedding_dim = tensor_info.shape[1];
   if (pImpl_->embedding_dim != embedding_dim)
-    throw std::runtime_error("Embedding dimension mismatch");
+    throw LoaderException("Embedding dimension mismatch");
   return pImpl_->vocab_size;
 }
 
