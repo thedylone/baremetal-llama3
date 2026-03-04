@@ -50,6 +50,6 @@ In addition to the binary files, a `metadata.json` file is created with the foll
 
 The C++ Loader uses `MappedFile`s following RAII to manage the lifecycle of memory mapped files, releasing and unmapping when the `MappedFile` goes out of scope.
 
-These `MappedFile`s are held by `TensorInfo` structs, which contain the extracted metadata and offset from the dumped file. A `shared_ptr` is used as the `LlamaDumpLoader` shares ownership of the embeddings `MappedFile`.
+These `MappedFile`s are held by `TensorInfo` structs, which contain the extracted metadata and offset from the dumped file.
 
 A private implementation class is used to load the tensor and populate a `TensorInfo`. Once the embeddings are loaded via `load_embeddings`, the embedding `MappedFile` is stored, allowing `vocab_size` and `embedding_dim` to be cached.

@@ -47,5 +47,6 @@ class LlamaDumpLoader {
   class Impl;
   std::unique_ptr<Impl> pImpl_;
   static void convert_and_write(float_t *output_ptr, const char *data_ptr,
-                                const int size, const DumpFloatType float_type);
+                                const size_t size,
+                                const DumpFloatType float_type);
 };
