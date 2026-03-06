@@ -2,34 +2,51 @@
 # You may change it and we use it to build your code.
 # DO NOT CHANGE RECIPE FOR TEST RELATED TARGETS 
 CXX := g++
+NVCC := nvcc
 CXXFLAGS := -std=c++17 -Wall -Wextra -pedantic -MMD -MP
-LDFLAGS :=
+NVCCFLAGS := -std=c++17 -arch=native -Xcompiler -Wall
+LDFLAGS := -lcudart
 BUILD ?= release
 
 ifeq ($(BUILD),debug)
   CXXFLAGS += -g -O0
+  NVCCFLAGS += -g -G -O0
 else
   CXXFLAGS += -O2
+  NVCCFLAGS += -O2
 endif
 
 SRC_DIR := src
 INC_DIR := include
+KERNEL_INC_DIR := kernel
 BUILD_DIR := build
 BIN_DIR := bin
 TARGET := llm
-SOURCES := main.cpp $(SRC_DIR)/tokenizer_bpe.cpp 
-OBJECTS := $(BUILD_DIR)/main.o $(BUILD_DIR)/tokenizer_bpe.o
+
+CPP_SOURCES := main.cpp $(SRC_DIR)/tokenizer_bpe.cpp
+CPP_OBJECTS := $(BUILD_DIR)/main.o $(BUILD_DIR)/tokenizer_bpe.o
+
+CUDA_SOURCES := $(wildcard $(SRC_DIR)/*.cu)
+CUDA_OBJECTS := $(patsubst $(SRC_DIR)/%.cu,$(BUILD_DIR)/%.o,$(CUDA_SOURCES))
+
+OBJECTS := $(CPP_OBJECTS) $(CUDA_OBJECTS)
+
 DEPS := $(OBJECTS:.o=.d)
-INCLUDES := -I$(INC_DIR) -I.
+INCLUDES := -I$(INC_DIR) -I. -I$(KERNEL_INC_DIR) -I/usr/local/cuda/include
 
 
 all: $(BIN_DIR)/$(TARGET)
 $(BIN_DIR)/$(TARGET): $(OBJECTS) | $(BIN_DIR)
-	$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
+	$(NVCC) $(OBJECTS) -o $@ $(LDFLAGS)
+
 $(BUILD_DIR)/main.o: main.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/tokenizer_bpe.o: $(SRC_DIR)/tokenizer_bpe.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
 $(BUILD_DIR) $(BIN_DIR):
 	mkdir -p $@
 
@@ -51,12 +68,12 @@ run: all
 
 .PHONY: tests
 
-TEST_OBJECTS := $(BUILD_DIR)/test.o $(BUILD_DIR)/test_api.o $(BUILD_DIR)/tokenizer_bpe.o
+TEST_OBJECTS := $(BUILD_DIR)/test.o $(BUILD_DIR)/test_api.o $(BUILD_DIR)/tokenizer_bpe.o $(CUDA_OBJECTS)
 
 tests: $(BIN_DIR)/tests
 
 $(BIN_DIR)/tests: $(TEST_OBJECTS) | $(BIN_DIR)
-	$(CXX) $(TEST_OBJECTS) -o $@ $(LDFLAGS)
+	$(NVCC) $(TEST_OBJECTS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test.o: tests/test.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
