@@ -239,8 +239,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-dir",
-        required=True,
         help="Directory containing config.json and .safetensors weights.",
+        default="assets/llama3",
     )
     parser.add_argument(
         "--cpp-output",
@@ -255,9 +255,9 @@ def parse_args() -> argparse.Namespace:
         "--token-ids",
         nargs="+",
         type=int,
-        required=True,
         metavar="ID",
         help="Tokens to verify (must match exactly what was passed to C++).",
+        default=[128000, 9906, 1917],
     )
     parser.add_argument(
         "--atol",
