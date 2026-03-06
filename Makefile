@@ -21,6 +21,7 @@ INC_DIR := include
 KERNEL_INC_DIR := kernel
 BUILD_DIR := build
 BIN_DIR := bin
+BENCH_DIR := benchmarks
 TARGET := llm
 
 CPP_SOURCES := main.cpp $(SRC_DIR)/tokenizer_bpe.cpp
@@ -80,3 +81,28 @@ $(BUILD_DIR)/test.o: tests/test.cpp | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_api.o: tests/test_api.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# ------------------------------------------------------------
+# Benchmarks build
+BENCH_SOURCES := $(wildcard $(BENCH_DIR)/*.cu)
+BENCH_TARGETS := $(patsubst $(BENCH_DIR)/%.cu,$(BIN_DIR)/%,$(BENCH_SOURCES))
+BENCH_OBJECTS := $(patsubst $(BENCH_DIR)/%.cu,$(BUILD_DIR)/bench_%.o,$(BENCH_SOURCES))
+
+.PHONY: benchmarks
+benchmarks: $(BENCH_TARGETS)
+
+# Link each benchmark binary against the shared CUDA objects
+$(BIN_DIR)/%: $(BUILD_DIR)/bench_%.o $(CUDA_OBJECTS) | $(BIN_DIR)
+	$(NVCC) $^ -o $@ $(LDFLAGS)
+
+# Compile each benchmark source
+$(BUILD_DIR)/bench_%.o: $(BENCH_DIR)/%.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+.PHONY: run_benchmarks
+run_benchmarks: benchmarks
+	@for b in $(BENCH_TARGETS); do \
+		echo "Running $$b ..."; \
+		./$$b; \
+		echo ""; \
+	done
