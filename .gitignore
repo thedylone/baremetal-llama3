@@ -13,3 +13,5 @@ gold/
 !assets/*/tokenizer.model
 
 .env
+.venv
+*.bin

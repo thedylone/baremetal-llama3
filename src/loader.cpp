@@ -230,7 +230,7 @@ class LlamaDumpLoader::Impl {
     tensor_info.shape.resize(num_dims);
     size_t num_elements = 1;
     for (uint32_t i = 0; i < num_dims; ++i) {
-      size_t dim = reader.read<size_t>();
+      size_t dim = static_cast<size_t>(reader.read<uint64_t>());
       if (dim == 0 || num_elements > SIZE_MAX / dim)
         throw LoaderException("Invalid tensor shape in file: " + file_path);
       tensor_info.shape[i] = dim;
@@ -285,19 +285,19 @@ bool LlamaDumpLoader::load_embeddings(const std::string& dump_path,
 }
 
 void LlamaDumpLoader::convert_and_write(float_t* output_ptr,
-                                        const char* data_ptr, const size_t size,
+                                        const char* data_ptr, const size_t num_elements,
                                         const DumpFloatType float_type) {
   // Handle type conversion
   switch (float_type) {
     case DumpFloatType::FP32:
-      std::memcpy(output_ptr, data_ptr, size * sizeof(float_t));
+      std::memcpy(output_ptr, data_ptr, num_elements * sizeof(float_t));
       break;
 
     case DumpFloatType::BF16:
       // Convert BF16 to FP32
       {
         const uint16_t* bf16_data = reinterpret_cast<const uint16_t*>(data_ptr);
-        for (size_t i = 0; i < size; ++i) {
+        for (size_t i = 0; i < num_elements; ++i) {
           output_ptr[i] =
               static_cast<float_t>(bfloat16_to_float32(bf16_data[i]));
         }
@@ -308,7 +308,7 @@ void LlamaDumpLoader::convert_and_write(float_t* output_ptr,
       // Convert FP16 to FP32
       {
         const uint16_t* f16_data = reinterpret_cast<const uint16_t*>(data_ptr);
-        for (size_t i = 0; i < size; ++i) {
+        for (size_t i = 0; i < num_elements; ++i) {
           output_ptr[i] = static_cast<float_t>(float16_to_float32(f16_data[i]));
         }
       }

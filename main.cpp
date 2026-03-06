@@ -4,6 +4,7 @@
 #include "loader.h"
 #include <iomanip>
 #include <iostream>
+#include <fstream>
 
 using namespace std;
 
@@ -57,6 +58,14 @@ void show_embeddings(string input = "Hello world") {
         }
         cout << "...]\n";
     }
+
+    // Save the embeddings to a file *cpp_embeddings.bin*
+    std::ofstream out("cpp_embeddings.bin", ios::binary);
+    if (!out) {
+        cerr << "Failed to open output file for embeddings\n";
+        return;
+    }
+    out.write(reinterpret_cast<char*>(embeddings), ids.size() * 4096 * sizeof(float_t));
 
     delete[] embeddings; // Free the allocated buffer
 }
