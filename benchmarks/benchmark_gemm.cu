@@ -15,7 +15,6 @@
 #include "kernel/gemm.cuh"
 #include "kernel/kernels.cuh"
 
-
 // ─── Variants
 // ─────────────────────────────────────────────────────────────────
 
@@ -27,6 +26,7 @@ struct Variant {
 static const std::vector<Variant> VARIANTS = {
     {"naive", sgemm_basic_launch},
     {"tiled", sgemm_tiled_launch},
+    {"register_tiled", sgemm_register_tiled_launch},
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
