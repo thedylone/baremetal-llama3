@@ -24,7 +24,7 @@ struct Variant {
 };
 
 static const std::vector<Variant> VARIANTS = {
-    {"naive", sgemm_basic_launch},
+    {"naive", sgemm_naive_launch},
     {"tiled", sgemm_tiled_launch},
     {"register_tiled", sgemm_register_tiled_launch},
 };
