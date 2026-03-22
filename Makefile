@@ -17,8 +17,8 @@ INC_DIR := include
 BUILD_DIR := build
 BIN_DIR := bin
 TARGET := llm
-SOURCES := main.cpp $(SRC_DIR)/tokenizer_bpe.cpp 
-OBJECTS := $(BUILD_DIR)/main.o $(BUILD_DIR)/tokenizer_bpe.o
+SOURCES := main.cpp $(SRC_DIR)/tokenizer_bpe.cpp $(SRC_DIR)/loader.cpp
+OBJECTS := $(BUILD_DIR)/main.o $(BUILD_DIR)/tokenizer_bpe.o $(BUILD_DIR)/loader.o
 DEPS := $(OBJECTS:.o=.d)
 INCLUDES := -I$(INC_DIR) -I.
 
@@ -29,6 +29,8 @@ $(BIN_DIR)/$(TARGET): $(OBJECTS) | $(BIN_DIR)
 $(BUILD_DIR)/main.o: main.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/tokenizer_bpe.o: $(SRC_DIR)/tokenizer_bpe.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/loader.o: $(SRC_DIR)/loader.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR) $(BIN_DIR):
 	mkdir -p $@
