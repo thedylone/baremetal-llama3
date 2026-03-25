@@ -53,7 +53,7 @@ run: all
 
 .PHONY: tests
 
-TEST_OBJECTS := $(BUILD_DIR)/test.o $(BUILD_DIR)/test_api.o $(BUILD_DIR)/tokenizer_bpe.o
+TEST_OBJECTS := $(BUILD_DIR)/test.o $(BUILD_DIR)/test_api.o $(BUILD_DIR)/tokenizer_bpe.o $(BUILD_DIR)/loader.o
 
 tests: $(BIN_DIR)/tests
 
