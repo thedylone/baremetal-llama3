@@ -4,7 +4,7 @@
 CXX := g++
 NVCC := nvcc
 CXXFLAGS := -std=c++17 -Wall -Wextra -pedantic -MMD -MP
-NVCCFLAGS := -std=c++17 -arch=native -Xcompiler -Wall
+NVCCFLAGS := -std=c++17 -arch=native -Xcompiler -Wall -lineinfo -MMD -MP
 LDFLAGS := -lcudart
 BUILD ?= release
 
@@ -104,11 +104,14 @@ BENCH_SOURCES := $(wildcard $(BENCH_DIR)/*.cu)
 BENCH_TARGETS := $(patsubst $(BENCH_DIR)/%.cu,$(BIN_DIR)/%,$(BENCH_SOURCES))
 BENCH_OBJECTS := $(patsubst $(BENCH_DIR)/%.cu,$(BUILD_DIR)/bench_%.o,$(BENCH_SOURCES))
 
+# Add common C++ objects needed by CUDA objects (e.g., model.o -> loader.o)
+BENCH_COMMON_OBJECTS := $(BUILD_DIR)/loader.o
+
 .PHONY: benchmarks
 benchmarks: $(BENCH_TARGETS)
 
 # Link each benchmark binary against the shared CUDA objects
-$(BIN_DIR)/%: $(BUILD_DIR)/bench_%.o $(CUDA_OBJECTS) | $(BIN_DIR)
+$(BIN_DIR)/%: $(BUILD_DIR)/bench_%.o $(CUDA_OBJECTS) $(BENCH_COMMON_OBJECTS) | $(BIN_DIR)
 	$(NVCC) $^ -o $@ $(LDFLAGS)
 
 # Compile each benchmark source
