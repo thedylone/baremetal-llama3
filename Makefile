@@ -85,6 +85,20 @@ $(BUILD_DIR)/test_api.o: tests/test_api.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # ------------------------------------------------------------
+# My tests build
+.PHONY: my_tests
+
+MY_TEST_OBJECTS := $(BUILD_DIR)/my_tests.o $(BUILD_DIR)/tokenizer_bpe.o $(BUILD_DIR)/loader.o $(CUDA_OBJECTS)
+
+my_tests: $(BIN_DIR)/my_tests
+
+$(BIN_DIR)/my_tests: $(MY_TEST_OBJECTS) | $(BIN_DIR)
+	$(NVCC) $(MY_TEST_OBJECTS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/my_tests.o: tests/my_tests.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# ------------------------------------------------------------
 # Benchmarks build
 BENCH_SOURCES := $(wildcard $(BENCH_DIR)/*.cu)
 BENCH_TARGETS := $(patsubst $(BENCH_DIR)/%.cu,$(BIN_DIR)/%,$(BENCH_SOURCES))

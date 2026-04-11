@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "gemm.cuh"
+#include "rms_norm.cuh"
 
 #define CUDA_CHECK(expr)                                              \
   do {                                                                \
