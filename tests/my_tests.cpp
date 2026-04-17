@@ -490,6 +490,97 @@ bool test_qkv_vs_python() {
 }
 
 // -----------------------------------------------------------------------------
+// RoPE vs Python reference test
+// (requires: python tools/generate_rope_reference.py)
+// -----------------------------------------------------------------------------
+
+bool test_rope_vs_python() {
+  const char* path = "tests/data/rope_reference.bin";
+  const float EPSILON = 1e-2f;
+
+  cout << "\n=== RoPE vs Python reference ===\n";
+
+  ifstream f(path, ios::binary);
+  if (!f) {
+    cout << "Reference file not found: " << path << "\n"
+         << "Run: python tools/generate_rope_reference.py\n";
+    return false;
+  }
+
+  int seq_len, hidden_size, kv_dim;
+  f.read(reinterpret_cast<char*>(&seq_len), sizeof(int));
+  f.read(reinterpret_cast<char*>(&hidden_size), sizeof(int));
+  f.read(reinterpret_cast<char*>(&kv_dim), sizeof(int));
+
+  vector<int> token_ids(seq_len);
+  f.read(reinterpret_cast<char*>(token_ids.data()), seq_len * sizeof(int));
+
+  vector<float> ref_q(seq_len * hidden_size);
+  vector<float> ref_k(seq_len * kv_dim);
+  f.read(reinterpret_cast<char*>(ref_q.data()),
+         seq_len * hidden_size * sizeof(float));
+  f.read(reinterpret_cast<char*>(ref_k.data()),
+         seq_len * kv_dim * sizeof(float));
+  f.close();
+
+  cout << "Reference: seq_len=" << seq_len << " hidden_size=" << hidden_size
+       << " kv_dim=" << kv_dim << " token_ids: ";
+  for (int id : token_ids) cout << id << " ";
+  cout << "\n";
+
+  // Load model and run: embed -> RMSNorm -> Q/K -> RoPE
+  LlamaModel model;
+  model.load("assets/llama3/dumped");
+
+  int* d_ids;
+  float *d_emb, *d_normed, *d_q, *d_k;
+  cudaMalloc(&d_ids, seq_len * sizeof(int));
+  cudaMalloc(&d_emb, seq_len * hidden_size * sizeof(float));
+  cudaMalloc(&d_normed, seq_len * hidden_size * sizeof(float));
+  cudaMalloc(&d_q, seq_len * hidden_size * sizeof(float));
+  cudaMalloc(&d_k, seq_len * kv_dim * sizeof(float));
+
+  cudaMemcpy(d_ids, token_ids.data(), seq_len * sizeof(int),
+             cudaMemcpyHostToDevice);
+
+  model.embed(d_ids, d_emb, seq_len);
+  rms_norm(d_emb, model.layers[0].d_input_layernorm_weight, d_normed, seq_len,
+           hidden_size);
+  sgemm(d_normed, model.layers[0].d_q_proj_weight, d_q, seq_len, hidden_size,
+        hidden_size);
+  sgemm(d_normed, model.layers[0].d_k_proj_weight, d_k, seq_len, kv_dim,
+        hidden_size);
+
+  // Apply RoPE in-place
+  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, seq_len, model.num_heads,
+             model.head_dim);
+  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, seq_len,
+             model.num_kv_heads, model.head_dim);
+  cudaDeviceSynchronize();
+
+  vector<float> got_q(seq_len * hidden_size);
+  vector<float> got_k(seq_len * kv_dim);
+  cudaMemcpy(got_q.data(), d_q, got_q.size() * sizeof(float),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(got_k.data(), d_k, got_k.size() * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ids);
+  cudaFree(d_emb);
+  cudaFree(d_normed);
+  cudaFree(d_q);
+  cudaFree(d_k);
+
+  bool all_ok = true;
+  all_ok &= check_max_abs("Q_rope", got_q, ref_q, EPSILON);
+  all_ok &= check_max_abs("K_rope", got_k, ref_k, EPSILON);
+
+  cout << (all_ok ? "All RoPE vs Python checks PASSED\n"
+                  : "Some RoPE vs Python checks FAILED\n");
+  return all_ok;
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
@@ -499,5 +590,6 @@ int main() {
   test_matrix_multiply();
   test_rms_norm();
   test_qkv_vs_python();
+  test_rope_vs_python();
   return 0;
 }

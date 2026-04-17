@@ -62,6 +62,12 @@ int main() {
   sgemm(d_normed, layer.d_v_proj_weight, d_v, seq_len, model.kv_dim,
         model.hidden_size);
 
+  // 7. RoPE (in-place on Q and K)
+  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, seq_len, model.num_heads,
+             model.head_dim);
+  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, seq_len,
+             model.num_kv_heads, model.head_dim);
+
   CUDA_CHECK(cudaDeviceSynchronize());
 
   // Print first 10 values per projection for verification
@@ -73,9 +79,9 @@ int main() {
     for (int i = 0; i < n; i++) cout << fixed << setprecision(4) << h[i] << " ";
     cout << "\n";
   };
-  print_first("Q", d_q, seq_len * model.hidden_size);
-  print_first("K", d_k, seq_len * model.kv_dim);
-  print_first("V", d_v, seq_len * model.kv_dim);
+  print_first("Q (after RoPE)", d_q, seq_len * model.hidden_size);
+  print_first("K (after RoPE)", d_k, seq_len * model.kv_dim);
+  print_first("V (no RoPE)", d_v, seq_len * model.kv_dim);
 
   // Cleanup
   cudaFree(d_ids);

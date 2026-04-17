@@ -13,6 +13,7 @@
 
 #include "gemm.cuh"
 #include "rms_norm.cuh"
+#include "rope.cuh"
 
 #define CUDA_CHECK(expr)                                              \
   do {                                                                \
