@@ -37,8 +37,8 @@ class LlamaModel {
   int kv_dim = 1024;   // num_kv_heads * head_dim
   int intermediate_size = 14336;
   int vocab_size = 128256;
-  float rms_norm_eps = 1e-5f;
-  float rope_theta = 500000.0f;
+  float rms_norm_eps = RMS_NORM_EPSILON;
+  float rope_theta = ROPE_THETA_BASE;
   int max_seq_len = 1000;
 
   // --- RoPE precomputed tables on GPU ---

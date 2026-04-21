@@ -1,6 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include "config.h"
+
 /// @brief Pre-compute cos/sin tables for RoPE on the GPU.
 /// @param d_cos Output cos table [max_seq_len, half_dim]
 /// @param d_sin Output sin table [max_seq_len, half_dim]
@@ -8,7 +10,7 @@
 /// @param head_dim Dimension per head (h_d = 128)
 /// @param theta_base RoPE base frequency (500000 for Llama 3)
 void rope_precompute(float* d_cos, float* d_sin, int max_seq_len, int head_dim,
-                     float theta_base = 500000.0f,
+                     float theta_base = ROPE_THETA_BASE,
                      cudaStream_t stream = nullptr);
 
 /// @brief Apply RoPE in-place to Q or K.
