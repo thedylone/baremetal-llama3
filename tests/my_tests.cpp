@@ -1,4 +1,3 @@
-
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -6,6 +5,7 @@
 #include <iostream>
 #include <vector>
 
+#include "attention.cuh"
 #include "config.h"
 #include "kernels.cuh"
 #include "model.h"
@@ -581,6 +581,392 @@ bool test_rope_vs_python() {
 }
 
 // -----------------------------------------------------------------------------
+// CPU GQA reference (self-contained, no model weights needed)
+// -----------------------------------------------------------------------------
+
+namespace {
+
+/// CPU causal-masked, numerically-stable softmax matching the CUDA kernel:
+///   mask value = -1e6, denominator += 1e-6
+void cpu_causal_softmax(vector<float>& scores, int seq_len) {
+  for (int p = 0; p < seq_len; p++) {
+    float* row = scores.data() + p * seq_len;
+    // causal mask
+    for (int q = p + 1; q < seq_len; q++) row[q] = -1e6f;
+    // row max
+    float mx = row[0];
+    for (int q = 1; q < seq_len; q++) mx = fmaxf(mx, row[q]);
+    // exp and sum
+    float sum = 0.0f;
+    for (int q = 0; q < seq_len; q++) {
+      row[q] = expf(row[q] - mx);
+      sum += row[q];
+    }
+    float inv = 1.0f / (sum + 1e-6f);
+    for (int q = 0; q < seq_len; q++) row[q] *= inv;
+  }
+}
+
+/// CPU GQA reference.
+/// Layouts: Q [S, H, D], K [S, H_kv, D], V [S, H_kv, D], out [S, H, D]
+vector<float> cpu_gqa(const vector<float>& Q, const vector<float>& K,
+                      const vector<float>& V, int seq_len, int num_heads,
+                      int num_kv_heads, int head_dim) {
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const int q_row = num_heads * head_dim;
+  const int kv_row = num_kv_heads * head_dim;
+
+  vector<float> out(seq_len * q_row, 0.0f);
+
+  for (int h = 0; h < num_heads; h++) {
+    int g = h / heads_per_kv;
+    // scores [S, S]
+    vector<float> scores(seq_len * seq_len, 0.0f);
+    for (int p = 0; p < seq_len; p++) {
+      for (int q = 0; q < seq_len; q++) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+          dot += Q[p * q_row + h * head_dim + d] *
+                 K[q * kv_row + g * head_dim + d];
+        scores[p * seq_len + q] = dot * scale;
+      }
+    }
+    cpu_causal_softmax(scores, seq_len);
+    // output = alpha @ V_g
+    for (int p = 0; p < seq_len; p++) {
+      for (int d = 0; d < head_dim; d++) {
+        float sum = 0.0f;
+        for (int k = 0; k < seq_len; k++)
+          sum += scores[p * seq_len + k] *
+                 V[k * kv_row + g * head_dim + d];
+        out[p * q_row + h * head_dim + d] = sum;
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+bool test_gqa_cpu() {
+  cout << "\n=== GQA self-contained CPU reference tests ===\n";
+  const float TOL = 1e-4f;
+  bool all_ok = true;
+
+  // Helper: deterministic pseudo-random fill
+  auto fill_rand = [](vector<float>& v, unsigned seed) {
+    srand(seed);
+    for (auto& x : v) x = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+  };
+
+  // ---- Test 1: basic GQA (4 query heads, 2 KV heads) ----
+  {
+    const int S = 4, H = 4, H_kv = 2, D = 8;
+    vector<float> Q(S * H * D), K(S * H_kv * D), V(S * H_kv * D);
+    fill_rand(Q, 42);
+    fill_rand(K, 43);
+    fill_rand(V, 44);
+
+    vector<float> expected = cpu_gqa(Q, K, V, S, H, H_kv, D);
+
+    float *d_q, *d_k, *d_v, *d_out;
+    cudaMalloc(&d_q, Q.size() * sizeof(float));
+    cudaMalloc(&d_k, K.size() * sizeof(float));
+    cudaMalloc(&d_v, V.size() * sizeof(float));
+    cudaMalloc(&d_out, expected.size() * sizeof(float));
+    cudaMemcpy(d_q, Q.data(), Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    gqa_attention(d_q, d_k, d_v, d_out, S, H, H_kv, D);
+    cudaDeviceSynchronize();
+
+    vector<float> got(expected.size());
+    cudaMemcpy(got.data(), d_out, got.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    all_ok &= check_max_abs("basic S=4 H=4 H_kv=2 D=8", got, expected, TOL);
+  }
+
+  // ---- Test 2: MHA special case (num_heads == num_kv_heads) ----
+  {
+    const int S = 3, H = 2, H_kv = 2, D = 4;
+    vector<float> Q(S * H * D), K(S * H_kv * D), V(S * H_kv * D);
+    fill_rand(Q, 100);
+    fill_rand(K, 101);
+    fill_rand(V, 102);
+
+    vector<float> expected = cpu_gqa(Q, K, V, S, H, H_kv, D);
+
+    float *d_q, *d_k, *d_v, *d_out;
+    cudaMalloc(&d_q, Q.size() * sizeof(float));
+    cudaMalloc(&d_k, K.size() * sizeof(float));
+    cudaMalloc(&d_v, V.size() * sizeof(float));
+    cudaMalloc(&d_out, expected.size() * sizeof(float));
+    cudaMemcpy(d_q, Q.data(), Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    gqa_attention(d_q, d_k, d_v, d_out, S, H, H_kv, D);
+    cudaDeviceSynchronize();
+
+    vector<float> got(expected.size());
+    cudaMemcpy(got.data(), d_out, got.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    all_ok &= check_max_abs("MHA S=3 H=2 H_kv=2 D=4", got, expected, TOL);
+  }
+
+  // ---- Test 3: seq_len=1 (single token, no masking needed) ----
+  {
+    const int S = 1, H = 4, H_kv = 2, D = 8;
+    vector<float> Q(S * H * D), K(S * H_kv * D), V(S * H_kv * D);
+    fill_rand(Q, 200);
+    fill_rand(K, 201);
+    fill_rand(V, 202);
+
+    vector<float> expected = cpu_gqa(Q, K, V, S, H, H_kv, D);
+
+    float *d_q, *d_k, *d_v, *d_out;
+    cudaMalloc(&d_q, Q.size() * sizeof(float));
+    cudaMalloc(&d_k, K.size() * sizeof(float));
+    cudaMalloc(&d_v, V.size() * sizeof(float));
+    cudaMalloc(&d_out, expected.size() * sizeof(float));
+    cudaMemcpy(d_q, Q.data(), Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    gqa_attention(d_q, d_k, d_v, d_out, S, H, H_kv, D);
+    cudaDeviceSynchronize();
+
+    vector<float> got(expected.size());
+    cudaMemcpy(got.data(), d_out, got.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    all_ok &= check_max_abs("single token S=1", got, expected, TOL);
+  }
+
+  // ---- Test 4: larger, Llama-like ratio (H=32, H_kv=8, D=16) ----
+  {
+    const int S = 6, H = 32, H_kv = 8, D = 16;
+    vector<float> Q(S * H * D), K(S * H_kv * D), V(S * H_kv * D);
+    fill_rand(Q, 300);
+    fill_rand(K, 301);
+    fill_rand(V, 302);
+
+    vector<float> expected = cpu_gqa(Q, K, V, S, H, H_kv, D);
+
+    float *d_q, *d_k, *d_v, *d_out;
+    cudaMalloc(&d_q, Q.size() * sizeof(float));
+    cudaMalloc(&d_k, K.size() * sizeof(float));
+    cudaMalloc(&d_v, V.size() * sizeof(float));
+    cudaMalloc(&d_out, expected.size() * sizeof(float));
+    cudaMemcpy(d_q, Q.data(), Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    gqa_attention(d_q, d_k, d_v, d_out, S, H, H_kv, D);
+    cudaDeviceSynchronize();
+
+    vector<float> got(expected.size());
+    cudaMemcpy(got.data(), d_out, got.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    all_ok &= check_max_abs("Llama-like S=6 H=32 H_kv=8 D=16", got, expected,
+                            TOL);
+  }
+
+  // ---- Test 5: verify causal masking (token 0 output must not depend on
+  //      later tokens) ----
+  {
+    const int S = 4, H = 2, H_kv = 1, D = 4;
+    vector<float> Q(S * H * D), K(S * H_kv * D), V(S * H_kv * D);
+    fill_rand(Q, 500);
+    fill_rand(K, 501);
+    fill_rand(V, 502);
+
+    // Run once with full sequence
+    float *d_q, *d_k, *d_v, *d_out;
+    cudaMalloc(&d_q, Q.size() * sizeof(float));
+    cudaMalloc(&d_k, K.size() * sizeof(float));
+    cudaMalloc(&d_v, V.size() * sizeof(float));
+    cudaMalloc(&d_out, S * H * D * sizeof(float));
+    cudaMemcpy(d_q, Q.data(), Q.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    gqa_attention(d_q, d_k, d_v, d_out, S, H, H_kv, D);
+    cudaDeviceSynchronize();
+
+    vector<float> full_out(S * H * D);
+    cudaMemcpy(full_out.data(), d_out, full_out.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    // Run with only token 0
+    const int S1 = 1;
+    vector<float> Q1(Q.begin(), Q.begin() + S1 * H * D);
+    vector<float> K1(K.begin(), K.begin() + S1 * H_kv * D);
+    vector<float> V1(V.begin(), V.begin() + S1 * H_kv * D);
+
+    cudaMalloc(&d_q, Q1.size() * sizeof(float));
+    cudaMalloc(&d_k, K1.size() * sizeof(float));
+    cudaMalloc(&d_v, V1.size() * sizeof(float));
+    cudaMalloc(&d_out, S1 * H * D * sizeof(float));
+    cudaMemcpy(d_q, Q1.data(), Q1.size() * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K1.data(), K1.size() * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V1.data(), V1.size() * sizeof(float),
+               cudaMemcpyHostToDevice);
+
+    gqa_attention(d_q, d_k, d_v, d_out, S1, H, H_kv, D);
+    cudaDeviceSynchronize();
+
+    vector<float> single_out(S1 * H * D);
+    cudaMemcpy(single_out.data(), d_out, single_out.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+
+    // Token 0's output row from the full run must match the single-token run
+    vector<float> row0(full_out.begin(), full_out.begin() + H * D);
+    all_ok &= check_max_abs("causal: token 0 unchanged", row0, single_out, TOL);
+  }
+
+  cout << (all_ok ? "All GQA CPU-reference tests PASSED\n"
+                  : "Some GQA CPU-reference tests FAILED\n");
+  return all_ok;
+}
+
+// -----------------------------------------------------------------------------
+// GQA vs Python reference test
+// (requires: python tools/generate_gqa_reference.py)
+// -----------------------------------------------------------------------------
+
+bool test_gqa_vs_python() {
+  const char* path = "tests/data/gqa_reference.bin";
+  const float EPSILON = 2e-2f;
+
+  cout << "\n=== GQA vs Python reference ===\n";
+
+  ifstream f(path, ios::binary);
+  if (!f) {
+    cout << "Reference file not found: " << path << "\n"
+         << "Run: python tools/generate_gqa_reference.py\n";
+    return false;
+  }
+
+  int seq_len, hidden_size, kv_dim, num_heads, num_kv_heads, head_dim;
+  f.read(reinterpret_cast<char*>(&seq_len), sizeof(int));
+  f.read(reinterpret_cast<char*>(&hidden_size), sizeof(int));
+  f.read(reinterpret_cast<char*>(&kv_dim), sizeof(int));
+  f.read(reinterpret_cast<char*>(&num_heads), sizeof(int));
+  f.read(reinterpret_cast<char*>(&num_kv_heads), sizeof(int));
+  f.read(reinterpret_cast<char*>(&head_dim), sizeof(int));
+
+  vector<int> token_ids(seq_len);
+  f.read(reinterpret_cast<char*>(token_ids.data()), seq_len * sizeof(int));
+
+  vector<float> ref_out(seq_len * hidden_size);
+  f.read(reinterpret_cast<char*>(ref_out.data()),
+         ref_out.size() * sizeof(float));
+  f.close();
+
+  cout << "Reference: seq_len=" << seq_len << " hidden_size=" << hidden_size
+       << " kv_dim=" << kv_dim << " num_heads=" << num_heads
+       << " num_kv_heads=" << num_kv_heads << " head_dim=" << head_dim
+       << " token_ids: ";
+  for (int id : token_ids) cout << id << " ";
+  cout << "\n";
+
+  if (hidden_size != num_heads * head_dim) {
+    cout << "Invalid reference: hidden_size != num_heads * head_dim\n";
+    return false;
+  }
+  if (kv_dim != num_kv_heads * head_dim) {
+    cout << "Invalid reference: kv_dim != num_kv_heads * head_dim\n";
+    return false;
+  }
+
+  // Load model and run: embed -> RMSNorm -> QKV -> RoPE(Q,K) -> GQA
+  LlamaModel model;
+  model.load("assets/llama3/dumped");
+
+  int* d_ids = nullptr;
+  float *d_emb = nullptr, *d_normed = nullptr, *d_q = nullptr, *d_k = nullptr,
+        *d_v = nullptr, *d_out = nullptr;
+
+  cudaMalloc(&d_ids, seq_len * sizeof(int));
+  cudaMalloc(&d_emb, seq_len * hidden_size * sizeof(float));
+  cudaMalloc(&d_normed, seq_len * hidden_size * sizeof(float));
+  cudaMalloc(&d_q, seq_len * hidden_size * sizeof(float));
+  cudaMalloc(&d_k, seq_len * kv_dim * sizeof(float));
+  cudaMalloc(&d_v, seq_len * kv_dim * sizeof(float));
+  cudaMalloc(&d_out, seq_len * hidden_size * sizeof(float));
+
+  cudaMemcpy(d_ids, token_ids.data(), seq_len * sizeof(int),
+             cudaMemcpyHostToDevice);
+
+  model.embed(d_ids, d_emb, seq_len);
+  rms_norm(d_emb, model.layers[0].d_input_layernorm_weight, d_normed, seq_len,
+           hidden_size);
+  sgemm(d_normed, model.layers[0].d_q_proj_weight, d_q, seq_len, hidden_size,
+        hidden_size);
+  sgemm(d_normed, model.layers[0].d_k_proj_weight, d_k, seq_len, kv_dim,
+        hidden_size);
+  sgemm(d_normed, model.layers[0].d_v_proj_weight, d_v, seq_len, kv_dim,
+        hidden_size);
+
+  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, seq_len, num_heads,
+             head_dim);
+  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, seq_len, num_kv_heads,
+             head_dim);
+
+  gqa_attention(d_q, d_k, d_v, d_out, seq_len, num_heads, num_kv_heads,
+                head_dim, nullptr);
+  cudaDeviceSynchronize();
+
+  vector<float> got_out(seq_len * hidden_size);
+  cudaMemcpy(got_out.data(), d_out, got_out.size() * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ids);
+  cudaFree(d_emb);
+  cudaFree(d_normed);
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_out);
+
+  bool ok = check_max_abs("GQA output", got_out, ref_out, EPSILON);
+  cout << (ok ? "GQA vs Python PASSED\n" : "GQA vs Python FAILED\n");
+  return ok;
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
@@ -591,5 +977,7 @@ int main() {
   test_rms_norm();
   test_qkv_vs_python();
   test_rope_vs_python();
+  test_gqa_cpu();
+  test_gqa_vs_python();
   return 0;
 }
