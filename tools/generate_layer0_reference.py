@@ -52,8 +52,17 @@ def main():
         outputs = model(input_ids)
         logits = outputs.logits[0, -1, :].float()
 
-    after_layer0 = captured["after_layer0"][0]  # [seq_len, hidden_size]
-    attn_output = captured["attn_output"][0]  # [seq_len, hidden_size]
+    # Extract captured tensors (handle tuple outputs from HuggingFace hooks)
+    raw_layer = captured["after_layer0"]
+    raw_attn = captured["attn_output"]
+    if isinstance(raw_layer, tuple):
+        raw_layer = raw_layer[0]
+    if isinstance(raw_attn, tuple):
+        raw_attn = raw_attn[0]
+
+    # Remove batch dimension: [1, seq, hidden] -> [seq, hidden]
+    after_layer0 = raw_layer.squeeze(0).float()
+    attn_output = raw_attn.squeeze(0).float()
 
     next_token_id = int(logits.argmax().item())
     next_token = tokenizer.decode([next_token_id])

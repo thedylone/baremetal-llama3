@@ -205,6 +205,43 @@ bool test_matrix_multiply() {
     }
   }
 
+  // Test case: N=1 (matrix-vector, used by lm_head)
+  {
+    int M = 256, K = 64, N = 1;
+    vector<float> A(M * K), B(K * N);
+    srand(55);
+    for (auto& v : A) v = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+    for (auto& v : B) v = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+
+    // CPU reference
+    vector<float> C_expected(M);
+    for (int i = 0; i < M; i++) {
+      float sum = 0.0f;
+      for (int k = 0; k < K; k++) sum += A[i * K + k] * B[k];
+      C_expected[i] = sum;
+    }
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_B, K * sizeof(float));
+    cudaMalloc(&d_C, M * sizeof(float));
+    cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B.data(), K * sizeof(float), cudaMemcpyHostToDevice);
+
+    sgemm(d_A, d_B, d_C, M, N, K);
+    cudaDeviceSynchronize();
+
+    vector<float> C(M);
+    cudaMemcpy(C.data(), d_C, M * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+
+    if (!check_max_abs("N=1 matvec 256x64", C, C_expected, EPSILON)) {
+      return false;
+    }
+  }
+
   cout << "All Matmul tests PASSED\n";
   return true;
 }

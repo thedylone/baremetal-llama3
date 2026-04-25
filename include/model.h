@@ -48,7 +48,7 @@ class LlamaModel {
   // --- Global weights on GPU ---
   float* d_embed_tokens = nullptr;    // [vocab_size, hidden_size]
   float* d_norm_weight = nullptr;     // [hidden_size]  (final RMSNorm)
-  float* d_lm_head_weight = nullptr;  // [hidden_size, vocab_size] (transposed)
+  float* d_lm_head_weight = nullptr;  // [hidden_size, vocab_size] (pre-transposed)
 
   // --- Per-layer weights ---
   std::vector<LlamaLayer> layers;
