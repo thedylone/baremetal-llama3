@@ -438,6 +438,7 @@ bool test_qkv_vs_python() {
   // Load model and run forward pass
   LlamaModel model;
   model.load("assets/llama3/dumped");
+  model.load_layer(0);
 
   int* d_ids;
   float *d_emb, *d_normed, *d_q, *d_k, *d_v;
@@ -532,6 +533,7 @@ bool test_rope_vs_python() {
   // Load model and run: embed -> RMSNorm -> Q/K -> RoPE
   LlamaModel model;
   model.load("assets/llama3/dumped");
+  model.load_layer(0);
 
   int* d_ids;
   float *d_emb, *d_normed, *d_q, *d_k;
@@ -914,6 +916,7 @@ bool test_gqa_vs_python() {
   // Load model and run: embed -> RMSNorm -> QKV -> RoPE(Q,K) -> GQA
   LlamaModel model;
   model.load("assets/llama3/dumped");
+  model.load_layer(0);
 
   int* d_ids = nullptr;
   float *d_emb = nullptr, *d_normed = nullptr, *d_q = nullptr, *d_k = nullptr,

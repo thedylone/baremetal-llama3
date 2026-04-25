@@ -81,7 +81,8 @@ void safe_free(float*& ptr) {
 // LlamaModel implementation
 // ---------------------------------------------------------------------------
 
-void LlamaModel::load(const std::string& dump_path) {
+void LlamaModel::load(const std::string& path) {
+  dump_path = path;
   hidden_size = EMBEDDING_DIM;
   rms_norm_eps = RMS_NORM_EPSILON;
 
@@ -92,42 +93,6 @@ void LlamaModel::load(const std::string& dump_path) {
       upload_2d(loader, dump_path + "/model_embed_tokens_weight.bin",
                 vocab_size, hidden_size);
 
-  // --- Per-layer weights ---
-  layers.resize(num_layers);
-  for (int l = 0; l < num_layers; l++) {
-    std::string p = dump_path + "/model_layers_" + std::to_string(l) + "_";
-    LlamaLayer& ly = layers[l];
-
-    // RMSNorm gamma [hidden_size]
-    ly.d_input_layernorm_weight =
-        upload_1d(loader, p + "input_layernorm_weight.bin", hidden_size);
-
-    // Projection weights stored as [out_dim, in_dim] in file.
-    // Pre-transpose to [in_dim, out_dim] so sgemm can compute
-    //   output = normed @ weight_T  directly.
-    ly.d_q_proj_weight = upload_2d_T(loader, p + "self_attn_q_proj_weight.bin",
-                                     hidden_size, hidden_size);
-    ly.d_k_proj_weight = upload_2d_T(loader, p + "self_attn_k_proj_weight.bin",
-                                     kv_dim, hidden_size);
-    ly.d_v_proj_weight = upload_2d_T(loader, p + "self_attn_v_proj_weight.bin",
-                                     kv_dim, hidden_size);
-    ly.d_o_proj_weight = upload_2d_T(loader, p + "self_attn_o_proj_weight.bin",
-                                     hidden_size, hidden_size);
-
-    // Post-attention RMSNorm gamma [hidden_size]
-    ly.d_post_attention_layernorm_weight =
-        upload_1d(loader, p + "post_attention_layernorm_weight.bin", hidden_size);
-
-    // MLP projections (file stores [out_dim, in_dim], pre-transpose)
-    ly.d_gate_proj_weight = upload_2d_T(
-        loader, p + "mlp_gate_proj_weight.bin", intermediate_size, hidden_size);
-    ly.d_up_proj_weight = upload_2d_T(
-        loader, p + "mlp_up_proj_weight.bin", intermediate_size, hidden_size);
-    ly.d_down_proj_weight = upload_2d_T(
-        loader, p + "mlp_down_proj_weight.bin", hidden_size, intermediate_size);
-  }
-
-  // --- Global weights ---
   d_norm_weight =
       upload_1d(loader, dump_path + "/model_norm_weight.bin", hidden_size);
 
@@ -139,6 +104,49 @@ void LlamaModel::load(const std::string& dump_path) {
   CUDA_CHECK(cudaMalloc(&d_rope_cos, rope_bytes));
   CUDA_CHECK(cudaMalloc(&d_rope_sin, rope_bytes));
   rope_precompute(d_rope_cos, d_rope_sin, max_seq_len, head_dim, rope_theta);
+
+  // Per-layer weights are loaded lazily during forward()
+  layers.resize(num_layers);
+}
+
+void LlamaModel::load_layer(int l) {
+  LlamaDumpLoader loader(DumpFloatType::FP32);
+  std::string p = dump_path + "/model_layers_" + std::to_string(l) + "_";
+  LlamaLayer& ly = layers[l];
+
+  ly.d_input_layernorm_weight =
+      upload_1d(loader, p + "input_layernorm_weight.bin", hidden_size);
+  ly.d_post_attention_layernorm_weight =
+      upload_1d(loader, p + "post_attention_layernorm_weight.bin", hidden_size);
+
+  ly.d_q_proj_weight = upload_2d_T(loader, p + "self_attn_q_proj_weight.bin",
+                                   hidden_size, hidden_size);
+  ly.d_k_proj_weight = upload_2d_T(loader, p + "self_attn_k_proj_weight.bin",
+                                   kv_dim, hidden_size);
+  ly.d_v_proj_weight = upload_2d_T(loader, p + "self_attn_v_proj_weight.bin",
+                                   kv_dim, hidden_size);
+  ly.d_o_proj_weight = upload_2d_T(loader, p + "self_attn_o_proj_weight.bin",
+                                   hidden_size, hidden_size);
+
+  ly.d_gate_proj_weight = upload_2d_T(
+      loader, p + "mlp_gate_proj_weight.bin", intermediate_size, hidden_size);
+  ly.d_up_proj_weight = upload_2d_T(
+      loader, p + "mlp_up_proj_weight.bin", intermediate_size, hidden_size);
+  ly.d_down_proj_weight = upload_2d_T(
+      loader, p + "mlp_down_proj_weight.bin", hidden_size, intermediate_size);
+}
+
+void LlamaModel::free_layer(int l) {
+  LlamaLayer& ly = layers[l];
+  safe_free(ly.d_input_layernorm_weight);
+  safe_free(ly.d_post_attention_layernorm_weight);
+  safe_free(ly.d_q_proj_weight);
+  safe_free(ly.d_k_proj_weight);
+  safe_free(ly.d_v_proj_weight);
+  safe_free(ly.d_o_proj_weight);
+  safe_free(ly.d_gate_proj_weight);
+  safe_free(ly.d_up_proj_weight);
+  safe_free(ly.d_down_proj_weight);
 }
 
 void LlamaModel::embed(const int* d_token_ids, float* d_output, int seq_len,
@@ -169,8 +177,9 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
   // --- Embedding lookup ---
   embed(d_token_ids, d_x, s, stream);
 
-  // --- 32 decoder layers ---
+  // --- 32 decoder layers (lazy load one layer at a time) ---
   for (int l = 0; l < num_layers; l++) {
+    load_layer(l);
     LlamaLayer& ly = layers[l];
 
     // -- Attention sub-block --
@@ -218,6 +227,13 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
 
     // Second residual: x += ffn_out
     residual_add(d_x, d_ffn_out, s * d, stream);
+
+    // Sync before freeing layer weights (kernels must finish first)
+    if (stream)
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    else
+      CUDA_CHECK(cudaDeviceSynchronize());
+    free_layer(l);
   }
 
   // --- Output layer ---
