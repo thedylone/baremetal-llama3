@@ -92,6 +92,12 @@ void LlamaModel::load(const std::string& dump_path) {
       upload_2d(loader, dump_path + "/model_embed_tokens_weight.bin",
                 vocab_size, hidden_size);
 
+  d_norm_weight =
+      upload_1d(loader, dump_path + "/model_norm_weight.bin", hidden_size);
+
+  d_lm_head_weight = upload_2d_T(
+      loader, dump_path + "/lm_head_weight.bin", vocab_size, hidden_size);
+
   // --- Per-layer weights ---
   layers.resize(num_layers);
   for (int l = 0; l < num_layers; l++) {
@@ -126,13 +132,6 @@ void LlamaModel::load(const std::string& dump_path) {
     ly.d_down_proj_weight = upload_2d_T(
         loader, p + "mlp_down_proj_weight.bin", hidden_size, intermediate_size);
   }
-
-  // --- Global weights ---
-  d_norm_weight =
-      upload_1d(loader, dump_path + "/model_norm_weight.bin", hidden_size);
-
-  // lm_head shares weights with embed_tokens in Llama 3
-  d_lm_head_weight = d_embed_tokens;
 
   // --- RoPE cos/sin tables ---
   size_t rope_bytes = max_seq_len * (head_dim / 2) * sizeof(float);
@@ -228,8 +227,8 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
   // Extract last token: d_normed + (s-1)*d points to last row [1, d]
   const float* d_last = d_normed + (s - 1) * d;
 
-  // Logits: [V, 1] = [V, d] @ [d, 1]  (embed_tokens is [V, d])
-  sgemm(d_lm_head_weight, d_last, d_logits, vocab_size, 1, d, 1.0f, 0.0f,
+  // Logits: [1, V] = [1, d] @ [d, V]  (lm_head pre-transposed to [d, V])
+  sgemm(d_last, d_lm_head_weight, d_logits, 1, vocab_size, d, 1.0f, 0.0f,
         stream);
 
   // --- Free scratch buffers ---
@@ -245,8 +244,6 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
 }
 
 void LlamaModel::free_weights() {
-  // lm_head shares memory with embed_tokens — avoid double free
-  if (d_lm_head_weight == d_embed_tokens) d_lm_head_weight = nullptr;
   safe_free(d_embed_tokens);
   safe_free(d_norm_weight);
   safe_free(d_lm_head_weight);
