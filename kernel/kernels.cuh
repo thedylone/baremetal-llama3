@@ -15,6 +15,7 @@
 #include "rms_norm.cuh"
 #include "rope.cuh"
 #include "attention.cuh"
+#include "residual_add.cuh"
 
 #define CUDA_CHECK(expr)                                              \
   do {                                                                \
