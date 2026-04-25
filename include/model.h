@@ -67,4 +67,11 @@ class LlamaModel {
   /// @param d_output    [seq_len, hidden_size] float array on device
   void embed(const int* d_token_ids, float* d_output, int seq_len,
              cudaStream_t stream = nullptr);
+
+  /// Run full forward pass: embed → 32 decoder layers → final norm → logits.
+  /// @param d_token_ids [seq_len] int array on device
+  /// @param d_logits    [vocab_size] float array on device (output, last token)
+  /// @param seq_len     number of tokens
+  void forward(const int* d_token_ids, float* d_logits, int seq_len,
+               cudaStream_t stream = nullptr);
 };

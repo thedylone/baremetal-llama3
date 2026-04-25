@@ -16,6 +16,7 @@
 #include "rope.cuh"
 #include "attention.cuh"
 #include "residual_add.cuh"
+#include "silu.cuh"
 
 #define CUDA_CHECK(expr)                                              \
   do {                                                                \

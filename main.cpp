@@ -1,5 +1,4 @@
-
-#include <iomanip>
+#include <algorithm>
 #include <iostream>
 #include <vector>
 
@@ -13,7 +12,7 @@ using namespace std;
 int main() {
   const string dump_path = "assets/llama3/dumped";
 
-  // 1. Load model weights to GPU
+  // 1. Load model
   cout << "Loading model weights...\n";
   LlamaModel model;
   model.load(dump_path);
@@ -22,10 +21,12 @@ int main() {
 
   // 2. Tokenize input
   BPETokenizer tok(TOKENIZER_PATH);
-  string input = "Hello world";
+  string input = "Yellow Fruit Like a";
   auto ids = tok.encode(input);
   int seq_len = static_cast<int>(ids.size());
-  cout << "Input: \"" << input << "\" -> " << seq_len << " tokens\n";
+  cout << "Input: \"" << input << "\" -> " << seq_len << " tokens: ";
+  for (int id : ids) cout << id << " ";
+  cout << "\n";
 
   // 3. Upload token ids to GPU
   int* d_ids;
@@ -33,63 +34,31 @@ int main() {
   CUDA_CHECK(cudaMemcpy(d_ids, ids.data(), seq_len * sizeof(int),
                         cudaMemcpyHostToDevice));
 
-  // 4. Allocate working buffers
-  size_t hidden_bytes = seq_len * model.hidden_size * sizeof(float);
-  float *d_emb, *d_normed;
-  float *d_q, *d_k, *d_v;
-  CUDA_CHECK(cudaMalloc(&d_emb, hidden_bytes));
-  CUDA_CHECK(cudaMalloc(&d_normed, hidden_bytes));
-  CUDA_CHECK(cudaMalloc(&d_q, seq_len * model.hidden_size * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_k, seq_len * model.kv_dim * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_v, seq_len * model.kv_dim * sizeof(float)));
+  // 4. Forward pass → logits for next token
+  float* d_logits;
+  CUDA_CHECK(cudaMalloc(&d_logits, model.vocab_size * sizeof(float)));
 
-  // 5. Embedding lookup
-  model.embed(d_ids, d_emb, seq_len);
-
-  // 6. Layer 0: RMSNorm -> Q/K/V projection
-  const LlamaLayer& layer = model.layers[0];
-
-  rms_norm(d_emb, layer.d_input_layernorm_weight, d_normed, seq_len,
-           model.hidden_size);
-
-  // Q = normed @ W_q^T   [seq, hidden] x [hidden, hidden] -> [seq, hidden]
-  sgemm(d_normed, layer.d_q_proj_weight, d_q, seq_len, model.hidden_size,
-        model.hidden_size);
-  // K = normed @ W_k^T   [seq, hidden] x [hidden, kv_dim] -> [seq, kv_dim]
-  sgemm(d_normed, layer.d_k_proj_weight, d_k, seq_len, model.kv_dim,
-        model.hidden_size);
-  // V = normed @ W_v^T   [seq, hidden] x [hidden, kv_dim] -> [seq, kv_dim]
-  sgemm(d_normed, layer.d_v_proj_weight, d_v, seq_len, model.kv_dim,
-        model.hidden_size);
-
-  // 7. RoPE (in-place on Q and K)
-  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, seq_len, model.num_heads,
-             model.head_dim);
-  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, seq_len,
-             model.num_kv_heads, model.head_dim);
-
+  cout << "Running forward pass...\n";
+  model.forward(d_ids, d_logits, seq_len);
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  // Print first 10 values per projection for verification
-  auto print_first = [](const char* name, float* d_ptr, int total) {
-    int n = min(total, 10);
-    vector<float> h(n);
-    cudaMemcpy(h.data(), d_ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
-    cout << name << "[0][0:" << n << "]: ";
-    for (int i = 0; i < n; i++) cout << fixed << setprecision(4) << h[i] << " ";
-    cout << "\n";
-  };
-  print_first("Q (after RoPE)", d_q, seq_len * model.hidden_size);
-  print_first("K (after RoPE)", d_k, seq_len * model.kv_dim);
-  print_first("V (no RoPE)", d_v, seq_len * model.kv_dim);
+  // 5. Argmax → next token id
+  vector<float> logits(model.vocab_size);
+  CUDA_CHECK(cudaMemcpy(logits.data(), d_logits,
+                        model.vocab_size * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  int next_id = static_cast<int>(
+      max_element(logits.begin(), logits.end()) - logits.begin());
+
+  // 6. Decode and print
+  string next_token = tok.decode({next_id});
+  cout << "Next token id: " << next_id << " -> \"" << next_token << "\"\n";
+  cout << "Full output: \"" << input << next_token << "\"\n";
 
   // Cleanup
   cudaFree(d_ids);
-  cudaFree(d_emb);
-  cudaFree(d_normed);
-  cudaFree(d_q);
-  cudaFree(d_k);
-  cudaFree(d_v);
+  cudaFree(d_logits);
 
   return 0;
 }

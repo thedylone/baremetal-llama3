@@ -147,6 +147,103 @@ void LlamaModel::embed(const int* d_token_ids, float* d_output, int seq_len,
       d_embed_tokens, d_token_ids, d_output, hidden_size);
 }
 
+void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
+                         cudaStream_t stream) {
+  const int s = seq_len;
+  const int d = hidden_size;
+
+  // --- Allocate scratch buffers ---
+  float *d_x, *d_normed, *d_q, *d_k, *d_v, *d_attn_out;
+  float *d_gate, *d_up, *d_ffn_out;
+
+  CUDA_CHECK(cudaMalloc(&d_x, s * d * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_normed, s * d * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_q, s * d * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_k, s * kv_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_v, s * kv_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_attn_out, s * d * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_gate, s * intermediate_size * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_up, s * intermediate_size * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_ffn_out, s * d * sizeof(float)));
+
+  // --- Embedding lookup ---
+  embed(d_token_ids, d_x, s, stream);
+
+  // --- 32 decoder layers ---
+  for (int l = 0; l < num_layers; l++) {
+    LlamaLayer& ly = layers[l];
+
+    // -- Attention sub-block --
+
+    // RMSNorm
+    rms_norm(d_x, ly.d_input_layernorm_weight, d_normed, s, d, stream);
+
+    // QKV projections
+    sgemm(d_normed, ly.d_q_proj_weight, d_q, s, d, d, 1.0f, 0.0f, stream);
+    sgemm(d_normed, ly.d_k_proj_weight, d_k, s, kv_dim, d, 1.0f, 0.0f, stream);
+    sgemm(d_normed, ly.d_v_proj_weight, d_v, s, kv_dim, d, 1.0f, 0.0f, stream);
+
+    // RoPE (in-place on Q and K)
+    rope_apply(d_q, d_rope_cos, d_rope_sin, s, num_heads, head_dim, stream);
+    rope_apply(d_k, d_rope_cos, d_rope_sin, s, num_kv_heads, head_dim, stream);
+
+    // GQA attention → d_attn_out [s, d]
+    gqa_attention(d_q, d_k, d_v, d_attn_out, s, num_heads, num_kv_heads,
+                  head_dim, stream);
+
+    // Output projection: [s, d] = [s, d] @ [d, d]
+    sgemm(d_attn_out, ly.d_o_proj_weight, d_normed, s, d, d, 1.0f, 0.0f,
+          stream);
+
+    // First residual: x += attn_out
+    residual_add(d_x, d_normed, s * d, stream);
+
+    // -- FFN sub-block --
+
+    // RMSNorm
+    rms_norm(d_x, ly.d_post_attention_layernorm_weight, d_normed, s, d, stream);
+
+    // SwiGLU: gate and up projections
+    sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, intermediate_size, d,
+          1.0f, 0.0f, stream);
+    sgemm(d_normed, ly.d_up_proj_weight, d_up, s, intermediate_size, d, 1.0f,
+          0.0f, stream);
+
+    // SiLU(gate) * up → d_gate in-place
+    silu(d_gate, d_up, s * intermediate_size, stream);
+
+    // Down projection: [s, d] = [s, intermediate] @ [intermediate, d]
+    sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d, intermediate_size,
+          1.0f, 0.0f, stream);
+
+    // Second residual: x += ffn_out
+    residual_add(d_x, d_ffn_out, s * d, stream);
+  }
+
+  // --- Output layer ---
+
+  // Final RMSNorm
+  rms_norm(d_x, d_norm_weight, d_normed, s, d, stream);
+
+  // Extract last token: d_normed + (s-1)*d points to last row [1, d]
+  const float* d_last = d_normed + (s - 1) * d;
+
+  // Logits: [V, 1] = [V, d] @ [d, 1]  (embed_tokens is [V, d])
+  sgemm(d_lm_head_weight, d_last, d_logits, vocab_size, 1, d, 1.0f, 0.0f,
+        stream);
+
+  // --- Free scratch buffers ---
+  cudaFree(d_x);
+  cudaFree(d_normed);
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_attn_out);
+  cudaFree(d_gate);
+  cudaFree(d_up);
+  cudaFree(d_ffn_out);
+}
+
 void LlamaModel::free_weights() {
   // lm_head shares memory with embed_tokens — avoid double free
   if (d_lm_head_weight == d_embed_tokens) d_lm_head_weight = nullptr;

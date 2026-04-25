@@ -1059,18 +1059,164 @@ bool test_silu() {
 }
 
 // -----------------------------------------------------------------------------
+// Residual add test
+// -----------------------------------------------------------------------------
+
+bool test_residual_add() {
+  cout << "\n=== Residual add test ===\n";
+  const float TOL = 1e-6f;
+  bool all_ok = true;
+
+  // Test 1: small known values
+  {
+    vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
+    vector<float> residual = {0.5f, -1.0f, 2.0f, -0.5f};
+    vector<float> expected = {1.5f, 1.0f, 5.0f, 3.5f};
+    int n = x.size();
+
+    float *d_x, *d_r;
+    cudaMalloc(&d_x, n * sizeof(float));
+    cudaMalloc(&d_r, n * sizeof(float));
+    cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_r, residual.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    residual_add(d_x, d_r, n);
+    cudaDeviceSynchronize();
+
+    vector<float> got(n);
+    cudaMemcpy(got.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_x);
+    cudaFree(d_r);
+
+    all_ok &= check_max_abs("small known", got, expected, TOL);
+  }
+
+  // Test 2: larger random array
+  {
+    const int n = 8192;
+    vector<float> x(n), residual(n), expected(n);
+    srand(99);
+    for (int i = 0; i < n; i++) {
+      x[i] = (rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+      residual[i] = (rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+      expected[i] = x[i] + residual[i];
+    }
+
+    float *d_x, *d_r;
+    cudaMalloc(&d_x, n * sizeof(float));
+    cudaMalloc(&d_r, n * sizeof(float));
+    cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_r, residual.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    residual_add(d_x, d_r, n);
+    cudaDeviceSynchronize();
+
+    vector<float> got(n);
+    cudaMemcpy(got.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_x);
+    cudaFree(d_r);
+
+    all_ok &= check_max_abs("random n=8192", got, expected, TOL);
+  }
+
+  cout << (all_ok ? "All residual add tests PASSED\n"
+                  : "Some residual add tests FAILED\n");
+  return all_ok;
+}
+
+// -----------------------------------------------------------------------------
+// Forward pass vs Python reference test
+// (requires: python tools/generate_forward_reference.py)
+// -----------------------------------------------------------------------------
+
+bool test_forward_vs_python() {
+  const char* path = "tests/data/forward_reference.bin";
+  const float EPSILON = 1.0f;
+
+  cout << "\n=== Forward vs Python reference ===\n";
+
+  ifstream f(path, ios::binary);
+  if (!f) {
+    cout << "Reference file not found: " << path << "\n"
+         << "Run: python tools/generate_forward_reference.py\n";
+    return false;
+  }
+
+  int seq_len, vocab_size, expected_token_id;
+  f.read(reinterpret_cast<char*>(&seq_len), sizeof(int));
+  f.read(reinterpret_cast<char*>(&vocab_size), sizeof(int));
+  f.read(reinterpret_cast<char*>(&expected_token_id), sizeof(int));
+
+  vector<int> token_ids(seq_len);
+  f.read(reinterpret_cast<char*>(token_ids.data()), seq_len * sizeof(int));
+
+  vector<float> ref_logits(vocab_size);
+  f.read(reinterpret_cast<char*>(ref_logits.data()),
+         vocab_size * sizeof(float));
+  f.close();
+
+  cout << "Reference: seq_len=" << seq_len << " vocab_size=" << vocab_size
+       << " expected_token=" << expected_token_id << " token_ids: ";
+  for (int id : token_ids) cout << id << " ";
+  cout << "\n";
+
+  // Load model and run forward pass
+  LlamaModel model;
+  model.load("assets/llama3/dumped");
+
+  int* d_ids;
+  float* d_logits;
+  cudaMalloc(&d_ids, seq_len * sizeof(int));
+  cudaMalloc(&d_logits, vocab_size * sizeof(float));
+  cudaMemcpy(d_ids, token_ids.data(), seq_len * sizeof(int),
+             cudaMemcpyHostToDevice);
+
+  model.forward(d_ids, d_logits, seq_len);
+  cudaDeviceSynchronize();
+
+  vector<float> got_logits(vocab_size);
+  cudaMemcpy(got_logits.data(), d_logits, vocab_size * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ids);
+  cudaFree(d_logits);
+
+  // Check argmax matches
+  int got_token = 0;
+  for (int i = 1; i < vocab_size; i++)
+    if (got_logits[i] > got_logits[got_token]) got_token = i;
+
+  bool argmax_ok = (got_token == expected_token_id);
+  cout << "  argmax: got=" << got_token << " expected=" << expected_token_id
+       << (argmax_ok ? " PASSED" : " FAILED") << "\n";
+
+  // Check logits numerically (loose tolerance — 32 layers of FP32 accumulation)
+  bool logits_ok = check_max_abs("logits", got_logits, ref_logits, EPSILON);
+
+  bool ok = argmax_ok && logits_ok;
+  cout << (ok ? "Forward vs Python PASSED\n" : "Forward vs Python FAILED\n");
+  return ok;
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
 int main() {
+  // Lightweight tests (no model weights needed)
+  test_silu();
+  test_residual_add();
   test_tokenizer();
-  test_embeddings_vs_python();
   test_matrix_multiply();
   test_rms_norm();
+  test_gqa_cpu();
+  cout << flush;
+
+  // Model-weight tests (need GPU with enough memory)
+  test_embeddings_vs_python();
   test_qkv_vs_python();
   test_rope_vs_python();
-  test_gqa_cpu();
   test_gqa_vs_python();
-  test_silu();
+  test_forward_vs_python();
   return 0;
 }
