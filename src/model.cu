@@ -111,7 +111,28 @@ void LlamaModel::load(const std::string& dump_path) {
                                      kv_dim, hidden_size);
     ly.d_v_proj_weight = upload_2d_T(loader, p + "self_attn_v_proj_weight.bin",
                                      kv_dim, hidden_size);
+    ly.d_o_proj_weight = upload_2d_T(loader, p + "self_attn_o_proj_weight.bin",
+                                     hidden_size, hidden_size);
+
+    // Post-attention RMSNorm gamma [hidden_size]
+    ly.d_post_attention_layernorm_weight =
+        upload_1d(loader, p + "post_attention_layernorm_weight.bin", hidden_size);
+
+    // MLP projections (file stores [out_dim, in_dim], pre-transpose)
+    ly.d_gate_proj_weight = upload_2d_T(
+        loader, p + "mlp_gate_proj_weight.bin", intermediate_size, hidden_size);
+    ly.d_up_proj_weight = upload_2d_T(
+        loader, p + "mlp_up_proj_weight.bin", intermediate_size, hidden_size);
+    ly.d_down_proj_weight = upload_2d_T(
+        loader, p + "mlp_down_proj_weight.bin", hidden_size, intermediate_size);
   }
+
+  // --- Global weights ---
+  d_norm_weight =
+      upload_1d(loader, dump_path + "/model_norm_weight.bin", hidden_size);
+
+  // lm_head shares weights with embed_tokens in Llama 3
+  d_lm_head_weight = d_embed_tokens;
 
   // --- RoPE cos/sin tables ---
   size_t rope_bytes = max_seq_len * (head_dim / 2) * sizeof(float);
@@ -127,6 +148,8 @@ void LlamaModel::embed(const int* d_token_ids, float* d_output, int seq_len,
 }
 
 void LlamaModel::free_weights() {
+  // lm_head shares memory with embed_tokens — avoid double free
+  if (d_lm_head_weight == d_embed_tokens) d_lm_head_weight = nullptr;
   safe_free(d_embed_tokens);
   safe_free(d_norm_weight);
   safe_free(d_lm_head_weight);

@@ -56,9 +56,7 @@ class LlamaModel {
   LlamaModel() = default;
   ~LlamaModel();
 
-  /// Load model weights from dump directory to GPU.
-  /// Currently loads: embeddings, per-layer input_layernorm + Q/K/V
-  /// projections.
+  /// Load all model weights from dump directory to GPU.
   void load(const std::string& dump_path);
 
   /// Free all GPU memory.
