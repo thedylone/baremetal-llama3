@@ -10,6 +10,7 @@
 #include "kernels.cuh"
 #include "model.h"
 #include "rms_norm.cuh"
+#include "silu.cuh"
 #include "tokenizer.h"
 
 using namespace std;
@@ -638,8 +639,7 @@ vector<float> cpu_gqa(const vector<float>& Q, const vector<float>& K,
       for (int d = 0; d < head_dim; d++) {
         float sum = 0.0f;
         for (int k = 0; k < seq_len; k++)
-          sum += scores[p * seq_len + k] *
-                 V[k * kv_row + g * head_dim + d];
+          sum += scores[p * seq_len + k] * V[k * kv_row + g * head_dim + d];
         out[p * q_row + h * head_dim + d] = sum;
       }
     }
@@ -789,8 +789,8 @@ bool test_gqa_cpu() {
     cudaFree(d_v);
     cudaFree(d_out);
 
-    all_ok &= check_max_abs("Llama-like S=6 H=32 H_kv=8 D=16", got, expected,
-                            TOL);
+    all_ok &=
+        check_max_abs("Llama-like S=6 H=32 H_kv=8 D=16", got, expected, TOL);
   }
 
   // ---- Test 5: verify causal masking (token 0 output must not depend on
@@ -967,6 +967,98 @@ bool test_gqa_vs_python() {
 }
 
 // -----------------------------------------------------------------------------
+// SiLU test
+// -----------------------------------------------------------------------------
+
+static float cpu_silu(float z) { return z / (1.0f + expf(-z)); }
+
+bool test_silu() {
+  cout << "\n=== SiLU·up test ===\n";
+  const float TOL = 1e-5f;
+  bool all_ok = true;
+
+  // Test 1: known values — SiLU(gate) * up
+  {
+    vector<float> gate = {0.0f, 1.0f, -1.0f, 2.0f, -2.0f, 5.0f, -5.0f};
+    vector<float> up = {1.0f, 2.0f, 0.5f, -1.0f, 3.0f, 0.1f, -0.2f};
+    int n = gate.size();
+    vector<float> expected(n);
+    for (int i = 0; i < n; i++) expected[i] = cpu_silu(gate[i]) * up[i];
+
+    float *d_gate, *d_up;
+    cudaMalloc(&d_gate, n * sizeof(float));
+    cudaMalloc(&d_up, n * sizeof(float));
+    cudaMemcpy(d_gate, gate.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    silu(d_gate, d_up, n);
+    cudaDeviceSynchronize();
+
+    vector<float> got(n);
+    cudaMemcpy(got.data(), d_gate, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_gate);
+    cudaFree(d_up);
+
+    all_ok &= check_max_abs("known values", got, expected, TOL);
+  }
+
+  // Test 2: gate=0 should give exactly 0 regardless of up
+  {
+    vector<float> gate = {0.0f};
+    vector<float> up = {42.0f};
+
+    float *d_gate, *d_up;
+    cudaMalloc(&d_gate, sizeof(float));
+    cudaMalloc(&d_up, sizeof(float));
+    cudaMemcpy(d_gate, gate.data(), sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up.data(), sizeof(float), cudaMemcpyHostToDevice);
+
+    silu(d_gate, d_up, 1);
+    cudaDeviceSynchronize();
+
+    vector<float> got(1);
+    cudaMemcpy(got.data(), d_gate, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_gate);
+    cudaFree(d_up);
+
+    all_ok &= check_max_abs("gate=0 exact", got, {0.0f}, 0.0f);
+  }
+
+  // Test 3: larger random array (exercises multi-block launch)
+  {
+    const int n = 10000;
+    vector<float> gate(n), up(n);
+    srand(77);
+    for (int i = 0; i < n; i++) {
+      gate[i] = (rand() / (float)RAND_MAX) * 10.0f - 5.0f;
+      up[i] = (rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+    }
+
+    vector<float> expected(n);
+    for (int i = 0; i < n; i++) expected[i] = cpu_silu(gate[i]) * up[i];
+
+    float *d_gate, *d_up;
+    cudaMalloc(&d_gate, n * sizeof(float));
+    cudaMalloc(&d_up, n * sizeof(float));
+    cudaMemcpy(d_gate, gate.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    silu(d_gate, d_up, n);
+    cudaDeviceSynchronize();
+
+    vector<float> got(n);
+    cudaMemcpy(got.data(), d_gate, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_gate);
+    cudaFree(d_up);
+
+    all_ok &= check_max_abs("random n=10000", got, expected, TOL);
+  }
+
+  cout << (all_ok ? "All SiLU tests PASSED\n" : "Some SiLU tests FAILED\n");
+  return all_ok;
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
@@ -979,5 +1071,6 @@ int main() {
   test_rope_vs_python();
   test_gqa_cpu();
   test_gqa_vs_python();
+  test_silu();
   return 0;
 }
