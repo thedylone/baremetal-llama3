@@ -98,7 +98,8 @@ int argmax_index(const std::vector<float>& values) {
 void LlamaModel::load(const std::string& path) {
   dump_path = path;
 
-  LlamaDumpLoader loader(DumpFloatType::FP32);
+  // Weights are dumped in BF16, so load and convert to FP32 on CPU
+  LlamaDumpLoader loader(DumpFloatType::BF16);
 
   // --- Global weights ---
   d_embed_tokens =
