@@ -592,10 +592,10 @@ bool test_rope_vs_python() {
         hidden_size);
 
   // Apply RoPE in-place
-  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, seq_len, model.num_heads,
-             model.head_dim);
+  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, seq_len, NUM_HEADS,
+             HEAD_DIM);
   rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, seq_len,
-             model.num_kv_heads, model.head_dim);
+             NUM_KV_HEADS, HEAD_DIM);
   cudaDeviceSynchronize();
 
   vector<float> got_q(seq_len * hidden_size);
@@ -1207,7 +1207,6 @@ bool test_layer0_vs_python() {
   LlamaLayer& ly = model.layers[0];
 
   int s = seq_len, d = hidden_size;
-  int kv_dim = model.kv_dim;
 
   // Allocate buffers
   int* d_ids;
@@ -1217,11 +1216,11 @@ bool test_layer0_vs_python() {
   cudaMalloc(&d_x, s * d * sizeof(float));
   cudaMalloc(&d_normed, s * d * sizeof(float));
   cudaMalloc(&d_q, s * d * sizeof(float));
-  cudaMalloc(&d_k, s * kv_dim * sizeof(float));
-  cudaMalloc(&d_v, s * kv_dim * sizeof(float));
+  cudaMalloc(&d_k, s * KV_DIM * sizeof(float));
+  cudaMalloc(&d_v, s * KV_DIM * sizeof(float));
   cudaMalloc(&d_attn_out, s * d * sizeof(float));
-  cudaMalloc(&d_gate, s * model.intermediate_size * sizeof(float));
-  cudaMalloc(&d_up, s * model.intermediate_size * sizeof(float));
+  cudaMalloc(&d_gate, s * INTERMEDIATE_SIZE * sizeof(float));
+  cudaMalloc(&d_up, s * INTERMEDIATE_SIZE * sizeof(float));
   cudaMalloc(&d_ffn_out, s * d * sizeof(float));
 
   cudaMemcpy(d_ids, token_ids.data(), s * sizeof(int), cudaMemcpyHostToDevice);
@@ -1232,14 +1231,14 @@ bool test_layer0_vs_python() {
   // --- Attention sub-block ---
   rms_norm(d_x, ly.d_input_layernorm_weight, d_normed, s, d);
   sgemm(d_normed, ly.d_q_proj_weight, d_q, s, d, d);
-  sgemm(d_normed, ly.d_k_proj_weight, d_k, s, kv_dim, d);
-  sgemm(d_normed, ly.d_v_proj_weight, d_v, s, kv_dim, d);
-  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, s, model.num_heads,
-             model.head_dim);
-  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, s, model.num_kv_heads,
-             model.head_dim);
-  gqa_attention(d_q, d_k, d_v, d_attn_out, s, model.num_heads,
-                model.num_kv_heads, model.head_dim);
+  sgemm(d_normed, ly.d_k_proj_weight, d_k, s, KV_DIM, d);
+  sgemm(d_normed, ly.d_v_proj_weight, d_v, s, KV_DIM, d);
+  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, s, NUM_HEADS,
+             HEAD_DIM);
+  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, s, NUM_KV_HEADS,
+             HEAD_DIM);
+  gqa_attention(d_q, d_k, d_v, d_attn_out, s, NUM_HEADS,
+                NUM_KV_HEADS, HEAD_DIM);
 
   // Check raw attention output (before O projection)
   cudaDeviceSynchronize();
@@ -1259,11 +1258,11 @@ bool test_layer0_vs_python() {
 
   // --- FFN sub-block ---
   rms_norm(d_x, ly.d_post_attention_layernorm_weight, d_normed, s, d);
-  sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, model.intermediate_size, d);
-  sgemm(d_normed, ly.d_up_proj_weight, d_up, s, model.intermediate_size, d);
-  silu(d_gate, d_up, s * model.intermediate_size);
+  sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, INTERMEDIATE_SIZE, d);
+  sgemm(d_normed, ly.d_up_proj_weight, d_up, s, INTERMEDIATE_SIZE, d);
+  silu(d_gate, d_up, s * INTERMEDIATE_SIZE);
   sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d,
-        model.intermediate_size);
+        INTERMEDIATE_SIZE);
   residual_add(d_x, d_ffn_out, s * d);
 
   cudaDeviceSynchronize();

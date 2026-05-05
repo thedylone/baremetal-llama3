@@ -20,8 +20,8 @@ int main() {
   auto load_t0 = chrono::high_resolution_clock::now();
   LlamaModel model;
   model.load(dump_path);
-  cout << "  Model loaded (" << model.num_layers << " layers, "
-       << "hidden_size=" << model.hidden_size << ").\n";
+  cout << "  Model loaded (" << NUM_LAYERS << " layers, "
+       << "embedding_dim=" << EMBEDDING_DIM << ").\n";
   auto load_t1 = chrono::high_resolution_clock::now();
   double load_ms = chrono::duration<double, milli>(load_t1 - load_t0).count();
   cout << "  Model loading time: " << load_ms << " ms\n";
@@ -49,7 +49,7 @@ int main() {
 
   // 4. Forward pass → logits for next token
   float* d_logits;
-  CUDA_CHECK(cudaMalloc(&d_logits, model.vocab_size * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_logits, VOCAB_SIZE * sizeof(float)));
 
   cout << "Running forward pass...\n";
   auto forward_t0 = chrono::high_resolution_clock::now();
@@ -61,9 +61,9 @@ int main() {
   cout << "  Forward pass: " << forward_ms << " ms\n";
 
   // 5. Argmax → next token id
-  vector<float> logits(model.vocab_size);
+  vector<float> logits(VOCAB_SIZE);
   CUDA_CHECK(cudaMemcpy(logits.data(), d_logits,
-                        model.vocab_size * sizeof(float),
+                        VOCAB_SIZE * sizeof(float),
                         cudaMemcpyDeviceToHost));
 
   int next_id = static_cast<int>(max_element(logits.begin(), logits.end()) -

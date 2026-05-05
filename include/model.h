@@ -28,27 +28,15 @@ struct LlamaLayer {
 /// Llama 3 8B model with weights resident on GPU.
 class LlamaModel {
  public:
-  // --- Configuration (Llama 3 8B) ---
-  int hidden_size = 4096;
-  int num_layers = 32;
-  int num_heads = 32;
-  int num_kv_heads = 8;
-  int head_dim = 128;  // hidden_size / num_heads
-  int kv_dim = 1024;   // num_kv_heads * head_dim
-  int intermediate_size = 14336;
-  int vocab_size = 128256;
-  float rms_norm_eps = RMS_NORM_EPSILON;
-  float rope_theta = ROPE_THETA_BASE;
-  int max_seq_len = 1000;
-
   // --- RoPE precomputed tables on GPU ---
   float* d_rope_cos = nullptr;  // [max_seq_len, head_dim/2]
   float* d_rope_sin = nullptr;  // [max_seq_len, head_dim/2]
 
   // --- Global weights on GPU ---
-  float* d_embed_tokens = nullptr;    // [vocab_size, hidden_size]
-  float* d_norm_weight = nullptr;     // [hidden_size]  (final RMSNorm)
-  float* d_lm_head_weight = nullptr;  // [hidden_size, vocab_size] (pre-transposed)
+  float* d_embed_tokens = nullptr;  // [vocab_size, hidden_size]
+  float* d_norm_weight = nullptr;   // [hidden_size]  (final RMSNorm)
+  float* d_lm_head_weight =
+      nullptr;  // [hidden_size, vocab_size] (pre-transposed)
 
   // --- Per-layer weights ---
   std::vector<LlamaLayer> layers;

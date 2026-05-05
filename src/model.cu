@@ -57,15 +57,15 @@ float* upload_2d_T(LlamaDumpLoader& loader, const std::string& path,
 
 // ---- Kernels ----
 
-/// One block per token, threads stride over hidden_size.
+/// One block per token, threads stride over EMBEDDING_DIM.
 __global__ void embedding_lookup_kernel(const float* __restrict__ table,
                                         const int* __restrict__ ids,
                                         float* __restrict__ out,
-                                        int hidden_size) {
+                                        int EMBEDDING_DIM) {
   const int tok = blockIdx.x;
-  const float* src = table + static_cast<size_t>(ids[tok]) * hidden_size;
-  float* dst = out + static_cast<size_t>(tok) * hidden_size;
-  for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) dst[i] = src[i];
+  const float* src = table + static_cast<size_t>(ids[tok]) * EMBEDDING_DIM;
+  float* dst = out + static_cast<size_t>(tok) * EMBEDDING_DIM;
+  for (int i = threadIdx.x; i < EMBEDDING_DIM; i += blockDim.x) dst[i] = src[i];
 }
 
 void safe_free(float*& ptr) {
@@ -83,31 +83,29 @@ void safe_free(float*& ptr) {
 
 void LlamaModel::load(const std::string& path) {
   dump_path = path;
-  hidden_size = EMBEDDING_DIM;
-  rms_norm_eps = RMS_NORM_EPSILON;
 
   LlamaDumpLoader loader(DumpFloatType::FP32);
 
   // --- Global weights ---
   d_embed_tokens =
       upload_2d(loader, dump_path + "/model_embed_tokens_weight.bin",
-                vocab_size, hidden_size);
+                VOCAB_SIZE, EMBEDDING_DIM);
 
   d_norm_weight =
-      upload_1d(loader, dump_path + "/model_norm_weight.bin", hidden_size);
+      upload_1d(loader, dump_path + "/model_norm_weight.bin", EMBEDDING_DIM);
 
   // Load lm_head weight (may differ from embed_tokens in some checkpoints)
   d_lm_head_weight = upload_2d_T(loader, dump_path + "/lm_head_weight.bin",
-                                 vocab_size, hidden_size);
+                                 VOCAB_SIZE, EMBEDDING_DIM);
 
   // --- RoPE cos/sin tables ---
-  size_t rope_bytes = max_seq_len * (head_dim / 2) * sizeof(float);
+  size_t rope_bytes = MAX_SEQ_LEN * (HEAD_DIM / 2) * sizeof(float);
   CUDA_CHECK(cudaMalloc(&d_rope_cos, rope_bytes));
   CUDA_CHECK(cudaMalloc(&d_rope_sin, rope_bytes));
-  rope_precompute(d_rope_cos, d_rope_sin, max_seq_len, head_dim, rope_theta);
+  rope_precompute(d_rope_cos, d_rope_sin, MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA_BASE);
 
   // Per-layer weights are loaded lazily during forward()
-  layers.resize(num_layers);
+  layers.resize(NUM_LAYERS);
 }
 
 void LlamaModel::load_layer(int l) {
@@ -116,25 +114,25 @@ void LlamaModel::load_layer(int l) {
   LlamaLayer& ly = layers[l];
 
   ly.d_input_layernorm_weight =
-      upload_1d(loader, p + "input_layernorm_weight.bin", hidden_size);
+      upload_1d(loader, p + "input_layernorm_weight.bin", EMBEDDING_DIM);
   ly.d_post_attention_layernorm_weight =
-      upload_1d(loader, p + "post_attention_layernorm_weight.bin", hidden_size);
+      upload_1d(loader, p + "post_attention_layernorm_weight.bin", EMBEDDING_DIM);
 
   ly.d_q_proj_weight = upload_2d_T(loader, p + "self_attn_q_proj_weight.bin",
-                                   hidden_size, hidden_size);
+                                   EMBEDDING_DIM, EMBEDDING_DIM);
   ly.d_k_proj_weight = upload_2d_T(loader, p + "self_attn_k_proj_weight.bin",
-                                   kv_dim, hidden_size);
+                                   KV_DIM, EMBEDDING_DIM);
   ly.d_v_proj_weight = upload_2d_T(loader, p + "self_attn_v_proj_weight.bin",
-                                   kv_dim, hidden_size);
+                                   KV_DIM, EMBEDDING_DIM);
   ly.d_o_proj_weight = upload_2d_T(loader, p + "self_attn_o_proj_weight.bin",
-                                   hidden_size, hidden_size);
+                                   EMBEDDING_DIM, EMBEDDING_DIM);
 
   ly.d_gate_proj_weight = upload_2d_T(loader, p + "mlp_gate_proj_weight.bin",
-                                      intermediate_size, hidden_size);
+                                      INTERMEDIATE_SIZE, EMBEDDING_DIM);
   ly.d_up_proj_weight = upload_2d_T(loader, p + "mlp_up_proj_weight.bin",
-                                    intermediate_size, hidden_size);
+                                    INTERMEDIATE_SIZE, EMBEDDING_DIM);
   ly.d_down_proj_weight = upload_2d_T(loader, p + "mlp_down_proj_weight.bin",
-                                      hidden_size, intermediate_size);
+                                      EMBEDDING_DIM, INTERMEDIATE_SIZE);
 }
 
 void LlamaModel::free_layer(int l) {
@@ -153,13 +151,13 @@ void LlamaModel::free_layer(int l) {
 void LlamaModel::embed(const int* d_token_ids, float* d_output, int seq_len,
                        cudaStream_t stream) {
   embedding_lookup_kernel<<<seq_len, 256, 0, stream>>>(
-      d_embed_tokens, d_token_ids, d_output, hidden_size);
+      d_embed_tokens, d_token_ids, d_output, EMBEDDING_DIM);
 }
 
 void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
                          cudaStream_t stream) {
   const int s = seq_len;
-  const int d = hidden_size;
+  const int d = EMBEDDING_DIM;
 
   // --- Allocate scratch buffers ---
   float *d_x, *d_normed, *d_q, *d_k, *d_v, *d_attn_out;
@@ -168,20 +166,20 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
   CUDA_CHECK(cudaMalloc(&d_x, s * d * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_normed, s * d * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_q, s * d * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_k, s * kv_dim * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_v, s * kv_dim * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_k, s * KV_DIM * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_v, s * KV_DIM * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_attn_out, s * d * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_gate, s * intermediate_size * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_up, s * intermediate_size * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_gate, s * INTERMEDIATE_SIZE * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_up, s * INTERMEDIATE_SIZE * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_ffn_out, s * d * sizeof(float)));
 
   // --- Embedding lookup ---
   embed(d_token_ids, d_x, s, stream);
 
   // --- 32 decoder layers (load in batches to reduce disk I/O) ---
-  const int batch = num_layers / 2;  // 16 layers per batch
-  for (int start = 0; start < num_layers; start += batch) {
-    int end = std::min(start + batch, num_layers);
+  const int batch = NUM_LAYERS / 32;  // 16 layers per batch
+  for (int start = 0; start < NUM_LAYERS; start += batch) {
+    int end = std::min(start + batch, NUM_LAYERS);
 
     // Load batch of layers
     for (int l = start; l < end; l++) load_layer(l);
@@ -194,17 +192,17 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
       rms_norm(d_x, ly.d_input_layernorm_weight, d_normed, s, d, stream);
 
       sgemm(d_normed, ly.d_q_proj_weight, d_q, s, d, d, 1.0f, 0.0f, stream);
-      sgemm(d_normed, ly.d_k_proj_weight, d_k, s, kv_dim, d, 1.0f, 0.0f,
+      sgemm(d_normed, ly.d_k_proj_weight, d_k, s, KV_DIM, d, 1.0f, 0.0f,
             stream);
-      sgemm(d_normed, ly.d_v_proj_weight, d_v, s, kv_dim, d, 1.0f, 0.0f,
+      sgemm(d_normed, ly.d_v_proj_weight, d_v, s, KV_DIM, d, 1.0f, 0.0f,
             stream);
 
-      rope_apply(d_q, d_rope_cos, d_rope_sin, s, num_heads, head_dim, stream);
-      rope_apply(d_k, d_rope_cos, d_rope_sin, s, num_kv_heads, head_dim,
+      rope_apply(d_q, d_rope_cos, d_rope_sin, s, NUM_HEADS, HEAD_DIM, stream);
+      rope_apply(d_k, d_rope_cos, d_rope_sin, s, NUM_KV_HEADS, HEAD_DIM,
                  stream);
 
-      gqa_attention(d_q, d_k, d_v, d_attn_out, s, num_heads, num_kv_heads,
-                    head_dim, stream);
+      gqa_attention(d_q, d_k, d_v, d_attn_out, s, NUM_HEADS, NUM_KV_HEADS,
+                    HEAD_DIM, stream);
 
       sgemm(d_attn_out, ly.d_o_proj_weight, d_normed, s, d, d, 1.0f, 0.0f,
             stream);
@@ -214,14 +212,14 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
       rms_norm(d_x, ly.d_post_attention_layernorm_weight, d_normed, s, d,
                stream);
 
-      sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, intermediate_size, d,
+      sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, INTERMEDIATE_SIZE, d,
             1.0f, 0.0f, stream);
-      sgemm(d_normed, ly.d_up_proj_weight, d_up, s, intermediate_size, d, 1.0f,
+      sgemm(d_normed, ly.d_up_proj_weight, d_up, s, INTERMEDIATE_SIZE, d, 1.0f,
             0.0f, stream);
 
-      silu(d_gate, d_up, s * intermediate_size, stream);
+      silu(d_gate, d_up, s * INTERMEDIATE_SIZE, stream);
 
-      sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d, intermediate_size,
+      sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d, INTERMEDIATE_SIZE,
             1.0f, 0.0f, stream);
       residual_add(d_x, d_ffn_out, s * d, stream);
     }
@@ -243,7 +241,7 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
   const float* d_last = d_normed + (s - 1) * d;
 
   // Logits: [1, V] = [1, d] @ [d, V]  (lm_head pre-transposed to [d, V])
-  sgemm(d_last, d_lm_head_weight, d_logits, 1, vocab_size, d, 1.0f, 0.0f,
+  sgemm(d_last, d_lm_head_weight, d_logits, 1, VOCAB_SIZE, d, 1.0f, 0.0f,
         stream);
 
   // --- Free scratch buffers ---
