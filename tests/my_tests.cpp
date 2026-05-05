@@ -205,6 +205,43 @@ bool test_matrix_multiply() {
     }
   }
 
+  // Test case: N=1 (matrix-vector, used by lm_head)
+  {
+    int M = 256, K = 64, N = 1;
+    vector<float> A(M * K), B(K * N);
+    srand(55);
+    for (auto& v : A) v = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+    for (auto& v : B) v = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+
+    // CPU reference
+    vector<float> C_expected(M);
+    for (int i = 0; i < M; i++) {
+      float sum = 0.0f;
+      for (int k = 0; k < K; k++) sum += A[i * K + k] * B[k];
+      C_expected[i] = sum;
+    }
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_B, K * sizeof(float));
+    cudaMalloc(&d_C, M * sizeof(float));
+    cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B.data(), K * sizeof(float), cudaMemcpyHostToDevice);
+
+    sgemm(d_A, d_B, d_C, M, N, K);
+    cudaDeviceSynchronize();
+
+    vector<float> C(M);
+    cudaMemcpy(C.data(), d_C, M * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+
+    if (!check_max_abs("N=1 matvec 256x64", C, C_expected, EPSILON)) {
+      return false;
+    }
+  }
+
   cout << "All Matmul tests PASSED\n";
   return true;
 }
@@ -438,6 +475,7 @@ bool test_qkv_vs_python() {
   // Load model and run forward pass
   LlamaModel model;
   model.load("assets/llama3/dumped");
+  model.load_layer(0);
 
   int* d_ids;
   float *d_emb, *d_normed, *d_q, *d_k, *d_v;
@@ -532,6 +570,7 @@ bool test_rope_vs_python() {
   // Load model and run: embed -> RMSNorm -> Q/K -> RoPE
   LlamaModel model;
   model.load("assets/llama3/dumped");
+  model.load_layer(0);
 
   int* d_ids;
   float *d_emb, *d_normed, *d_q, *d_k;
@@ -914,6 +953,7 @@ bool test_gqa_vs_python() {
   // Load model and run: embed -> RMSNorm -> QKV -> RoPE(Q,K) -> GQA
   LlamaModel model;
   model.load("assets/llama3/dumped");
+  model.load_layer(0);
 
   int* d_ids = nullptr;
   float *d_emb = nullptr, *d_normed = nullptr, *d_q = nullptr, *d_k = nullptr,
@@ -1125,6 +1165,135 @@ bool test_residual_add() {
 }
 
 // -----------------------------------------------------------------------------
+// Layer 0 decoder block diagnostic test
+// (requires: python tools/generate_layer0_reference.py)
+// -----------------------------------------------------------------------------
+
+bool test_layer0_vs_python() {
+  const char* path = "tests/data/layer0_reference.bin";
+  const float EPSILON = 5e-2f;
+
+  cout << "\n=== Layer 0 decoder block vs Python reference ===\n";
+
+  ifstream f(path, ios::binary);
+  if (!f) {
+    cout << "Reference file not found: " << path << "\n"
+         << "Run: python tools/generate_layer0_reference.py\n";
+    return false;
+  }
+
+  int seq_len, hidden_size;
+  f.read(reinterpret_cast<char*>(&seq_len), sizeof(int));
+  f.read(reinterpret_cast<char*>(&hidden_size), sizeof(int));
+
+  vector<int> token_ids(seq_len);
+  f.read(reinterpret_cast<char*>(token_ids.data()), seq_len * sizeof(int));
+
+  vector<float> ref_attn(seq_len * hidden_size);
+  f.read(reinterpret_cast<char*>(ref_attn.data()),
+         ref_attn.size() * sizeof(float));
+
+  vector<float> ref_after(seq_len * hidden_size);
+  f.read(reinterpret_cast<char*>(ref_after.data()),
+         ref_after.size() * sizeof(float));
+  f.close();
+
+  cout << "Reference: seq_len=" << seq_len << " hidden_size=" << hidden_size
+       << "\n";
+
+  LlamaModel model;
+  model.load("assets/llama3/dumped");
+  model.load_layer(0);
+  LlamaLayer& ly = model.layers[0];
+
+  int s = seq_len, d = hidden_size;
+  int kv_dim = model.kv_dim;
+
+  // Allocate buffers
+  int* d_ids;
+  float *d_x, *d_normed, *d_q, *d_k, *d_v, *d_attn_out;
+  float *d_gate, *d_up, *d_ffn_out;
+  cudaMalloc(&d_ids, s * sizeof(int));
+  cudaMalloc(&d_x, s * d * sizeof(float));
+  cudaMalloc(&d_normed, s * d * sizeof(float));
+  cudaMalloc(&d_q, s * d * sizeof(float));
+  cudaMalloc(&d_k, s * kv_dim * sizeof(float));
+  cudaMalloc(&d_v, s * kv_dim * sizeof(float));
+  cudaMalloc(&d_attn_out, s * d * sizeof(float));
+  cudaMalloc(&d_gate, s * model.intermediate_size * sizeof(float));
+  cudaMalloc(&d_up, s * model.intermediate_size * sizeof(float));
+  cudaMalloc(&d_ffn_out, s * d * sizeof(float));
+
+  cudaMemcpy(d_ids, token_ids.data(), s * sizeof(int), cudaMemcpyHostToDevice);
+
+  // Embedding
+  model.embed(d_ids, d_x, s);
+
+  // --- Attention sub-block ---
+  rms_norm(d_x, ly.d_input_layernorm_weight, d_normed, s, d);
+  sgemm(d_normed, ly.d_q_proj_weight, d_q, s, d, d);
+  sgemm(d_normed, ly.d_k_proj_weight, d_k, s, kv_dim, d);
+  sgemm(d_normed, ly.d_v_proj_weight, d_v, s, kv_dim, d);
+  rope_apply(d_q, model.d_rope_cos, model.d_rope_sin, s, model.num_heads,
+             model.head_dim);
+  rope_apply(d_k, model.d_rope_cos, model.d_rope_sin, s, model.num_kv_heads,
+             model.head_dim);
+  gqa_attention(d_q, d_k, d_v, d_attn_out, s, model.num_heads,
+                model.num_kv_heads, model.head_dim);
+
+  // Check raw attention output (before O projection)
+  cudaDeviceSynchronize();
+  vector<float> got_attn_raw(s * d);
+  cudaMemcpy(got_attn_raw.data(), d_attn_out, s * d * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  // Output projection + first residual
+  sgemm(d_attn_out, ly.d_o_proj_weight, d_normed, s, d, d);
+  residual_add(d_x, d_normed, s * d);
+
+  // Check attention output after O projection + residual
+  cudaDeviceSynchronize();
+  vector<float> got_after_attn(s * d);
+  cudaMemcpy(got_after_attn.data(), d_normed, s * d * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  // --- FFN sub-block ---
+  rms_norm(d_x, ly.d_post_attention_layernorm_weight, d_normed, s, d);
+  sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, model.intermediate_size, d);
+  sgemm(d_normed, ly.d_up_proj_weight, d_up, s, model.intermediate_size, d);
+  silu(d_gate, d_up, s * model.intermediate_size);
+  sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d,
+        model.intermediate_size);
+  residual_add(d_x, d_ffn_out, s * d);
+
+  cudaDeviceSynchronize();
+
+  // Check full layer output (after both residuals)
+  vector<float> got_after(s * d);
+  cudaMemcpy(got_after.data(), d_x, s * d * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  cudaFree(d_ids);
+  cudaFree(d_x);
+  cudaFree(d_normed);
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_attn_out);
+  cudaFree(d_gate);
+  cudaFree(d_up);
+  cudaFree(d_ffn_out);
+
+  bool all_ok = true;
+  all_ok &= check_max_abs("attn O-proj output", got_after_attn, ref_attn, EPSILON);
+  all_ok &= check_max_abs("full layer 0 output", got_after, ref_after, EPSILON);
+
+  cout << (all_ok ? "Layer 0 vs Python PASSED\n"
+                  : "Layer 0 vs Python FAILED\n");
+  return all_ok;
+}
+
+// -----------------------------------------------------------------------------
 // Forward pass vs Python reference test
 // (requires: python tools/generate_forward_reference.py)
 // -----------------------------------------------------------------------------
@@ -1217,6 +1386,7 @@ int main() {
   test_qkv_vs_python();
   test_rope_vs_python();
   test_gqa_vs_python();
+  test_layer0_vs_python();
   test_forward_vs_python();
   return 0;
 }

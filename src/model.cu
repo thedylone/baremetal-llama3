@@ -81,7 +81,8 @@ void safe_free(float*& ptr) {
 // LlamaModel implementation
 // ---------------------------------------------------------------------------
 
-void LlamaModel::load(const std::string& dump_path) {
+void LlamaModel::load(const std::string& path) {
+  dump_path = path;
   hidden_size = EMBEDDING_DIM;
   rms_norm_eps = RMS_NORM_EPSILON;
 
@@ -95,49 +96,58 @@ void LlamaModel::load(const std::string& dump_path) {
   d_norm_weight =
       upload_1d(loader, dump_path + "/model_norm_weight.bin", hidden_size);
 
-  d_lm_head_weight = upload_2d_T(
-      loader, dump_path + "/lm_head_weight.bin", vocab_size, hidden_size);
-
-  // --- Per-layer weights ---
-  layers.resize(num_layers);
-  for (int l = 0; l < num_layers; l++) {
-    std::string p = dump_path + "/model_layers_" + std::to_string(l) + "_";
-    LlamaLayer& ly = layers[l];
-
-    // RMSNorm gamma [hidden_size]
-    ly.d_input_layernorm_weight =
-        upload_1d(loader, p + "input_layernorm_weight.bin", hidden_size);
-
-    // Projection weights stored as [out_dim, in_dim] in file.
-    // Pre-transpose to [in_dim, out_dim] so sgemm can compute
-    //   output = normed @ weight_T  directly.
-    ly.d_q_proj_weight = upload_2d_T(loader, p + "self_attn_q_proj_weight.bin",
-                                     hidden_size, hidden_size);
-    ly.d_k_proj_weight = upload_2d_T(loader, p + "self_attn_k_proj_weight.bin",
-                                     kv_dim, hidden_size);
-    ly.d_v_proj_weight = upload_2d_T(loader, p + "self_attn_v_proj_weight.bin",
-                                     kv_dim, hidden_size);
-    ly.d_o_proj_weight = upload_2d_T(loader, p + "self_attn_o_proj_weight.bin",
-                                     hidden_size, hidden_size);
-
-    // Post-attention RMSNorm gamma [hidden_size]
-    ly.d_post_attention_layernorm_weight =
-        upload_1d(loader, p + "post_attention_layernorm_weight.bin", hidden_size);
-
-    // MLP projections (file stores [out_dim, in_dim], pre-transpose)
-    ly.d_gate_proj_weight = upload_2d_T(
-        loader, p + "mlp_gate_proj_weight.bin", intermediate_size, hidden_size);
-    ly.d_up_proj_weight = upload_2d_T(
-        loader, p + "mlp_up_proj_weight.bin", intermediate_size, hidden_size);
-    ly.d_down_proj_weight = upload_2d_T(
-        loader, p + "mlp_down_proj_weight.bin", hidden_size, intermediate_size);
-  }
+  // Load lm_head weight (may differ from embed_tokens in some checkpoints)
+  d_lm_head_weight = upload_2d_T(loader, dump_path + "/lm_head_weight.bin",
+                                 vocab_size, hidden_size);
 
   // --- RoPE cos/sin tables ---
   size_t rope_bytes = max_seq_len * (head_dim / 2) * sizeof(float);
   CUDA_CHECK(cudaMalloc(&d_rope_cos, rope_bytes));
   CUDA_CHECK(cudaMalloc(&d_rope_sin, rope_bytes));
   rope_precompute(d_rope_cos, d_rope_sin, max_seq_len, head_dim, rope_theta);
+
+  // Per-layer weights are loaded lazily during forward()
+  layers.resize(num_layers);
+}
+
+void LlamaModel::load_layer(int l) {
+  LlamaDumpLoader loader(DumpFloatType::FP32);
+  std::string p = dump_path + "/model_layers_" + std::to_string(l) + "_";
+  LlamaLayer& ly = layers[l];
+
+  ly.d_input_layernorm_weight =
+      upload_1d(loader, p + "input_layernorm_weight.bin", hidden_size);
+  ly.d_post_attention_layernorm_weight =
+      upload_1d(loader, p + "post_attention_layernorm_weight.bin", hidden_size);
+
+  ly.d_q_proj_weight = upload_2d_T(loader, p + "self_attn_q_proj_weight.bin",
+                                   hidden_size, hidden_size);
+  ly.d_k_proj_weight = upload_2d_T(loader, p + "self_attn_k_proj_weight.bin",
+                                   kv_dim, hidden_size);
+  ly.d_v_proj_weight = upload_2d_T(loader, p + "self_attn_v_proj_weight.bin",
+                                   kv_dim, hidden_size);
+  ly.d_o_proj_weight = upload_2d_T(loader, p + "self_attn_o_proj_weight.bin",
+                                   hidden_size, hidden_size);
+
+  ly.d_gate_proj_weight = upload_2d_T(loader, p + "mlp_gate_proj_weight.bin",
+                                      intermediate_size, hidden_size);
+  ly.d_up_proj_weight = upload_2d_T(loader, p + "mlp_up_proj_weight.bin",
+                                    intermediate_size, hidden_size);
+  ly.d_down_proj_weight = upload_2d_T(loader, p + "mlp_down_proj_weight.bin",
+                                      hidden_size, intermediate_size);
+}
+
+void LlamaModel::free_layer(int l) {
+  LlamaLayer& ly = layers[l];
+  safe_free(ly.d_input_layernorm_weight);
+  safe_free(ly.d_post_attention_layernorm_weight);
+  safe_free(ly.d_q_proj_weight);
+  safe_free(ly.d_k_proj_weight);
+  safe_free(ly.d_v_proj_weight);
+  safe_free(ly.d_o_proj_weight);
+  safe_free(ly.d_gate_proj_weight);
+  safe_free(ly.d_up_proj_weight);
+  safe_free(ly.d_down_proj_weight);
 }
 
 void LlamaModel::embed(const int* d_token_ids, float* d_output, int seq_len,
@@ -168,55 +178,60 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
   // --- Embedding lookup ---
   embed(d_token_ids, d_x, s, stream);
 
-  // --- 32 decoder layers ---
-  for (int l = 0; l < num_layers; l++) {
-    LlamaLayer& ly = layers[l];
+  // --- 32 decoder layers (load in batches to reduce disk I/O) ---
+  const int batch = num_layers / 2;  // 16 layers per batch
+  for (int start = 0; start < num_layers; start += batch) {
+    int end = std::min(start + batch, num_layers);
 
-    // -- Attention sub-block --
+    // Load batch of layers
+    for (int l = start; l < end; l++) load_layer(l);
 
-    // RMSNorm
-    rms_norm(d_x, ly.d_input_layernorm_weight, d_normed, s, d, stream);
+    // Run batch
+    for (int l = start; l < end; l++) {
+      LlamaLayer& ly = layers[l];
 
-    // QKV projections
-    sgemm(d_normed, ly.d_q_proj_weight, d_q, s, d, d, 1.0f, 0.0f, stream);
-    sgemm(d_normed, ly.d_k_proj_weight, d_k, s, kv_dim, d, 1.0f, 0.0f, stream);
-    sgemm(d_normed, ly.d_v_proj_weight, d_v, s, kv_dim, d, 1.0f, 0.0f, stream);
+      // -- Attention sub-block --
+      rms_norm(d_x, ly.d_input_layernorm_weight, d_normed, s, d, stream);
 
-    // RoPE (in-place on Q and K)
-    rope_apply(d_q, d_rope_cos, d_rope_sin, s, num_heads, head_dim, stream);
-    rope_apply(d_k, d_rope_cos, d_rope_sin, s, num_kv_heads, head_dim, stream);
+      sgemm(d_normed, ly.d_q_proj_weight, d_q, s, d, d, 1.0f, 0.0f, stream);
+      sgemm(d_normed, ly.d_k_proj_weight, d_k, s, kv_dim, d, 1.0f, 0.0f,
+            stream);
+      sgemm(d_normed, ly.d_v_proj_weight, d_v, s, kv_dim, d, 1.0f, 0.0f,
+            stream);
 
-    // GQA attention → d_attn_out [s, d]
-    gqa_attention(d_q, d_k, d_v, d_attn_out, s, num_heads, num_kv_heads,
-                  head_dim, stream);
+      rope_apply(d_q, d_rope_cos, d_rope_sin, s, num_heads, head_dim, stream);
+      rope_apply(d_k, d_rope_cos, d_rope_sin, s, num_kv_heads, head_dim,
+                 stream);
 
-    // Output projection: [s, d] = [s, d] @ [d, d]
-    sgemm(d_attn_out, ly.d_o_proj_weight, d_normed, s, d, d, 1.0f, 0.0f,
-          stream);
+      gqa_attention(d_q, d_k, d_v, d_attn_out, s, num_heads, num_kv_heads,
+                    head_dim, stream);
 
-    // First residual: x += attn_out
-    residual_add(d_x, d_normed, s * d, stream);
+      sgemm(d_attn_out, ly.d_o_proj_weight, d_normed, s, d, d, 1.0f, 0.0f,
+            stream);
+      residual_add(d_x, d_normed, s * d, stream);
 
-    // -- FFN sub-block --
+      // -- FFN sub-block --
+      rms_norm(d_x, ly.d_post_attention_layernorm_weight, d_normed, s, d,
+               stream);
 
-    // RMSNorm
-    rms_norm(d_x, ly.d_post_attention_layernorm_weight, d_normed, s, d, stream);
+      sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, intermediate_size, d,
+            1.0f, 0.0f, stream);
+      sgemm(d_normed, ly.d_up_proj_weight, d_up, s, intermediate_size, d, 1.0f,
+            0.0f, stream);
 
-    // SwiGLU: gate and up projections
-    sgemm(d_normed, ly.d_gate_proj_weight, d_gate, s, intermediate_size, d,
-          1.0f, 0.0f, stream);
-    sgemm(d_normed, ly.d_up_proj_weight, d_up, s, intermediate_size, d, 1.0f,
-          0.0f, stream);
+      silu(d_gate, d_up, s * intermediate_size, stream);
 
-    // SiLU(gate) * up → d_gate in-place
-    silu(d_gate, d_up, s * intermediate_size, stream);
+      sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d, intermediate_size,
+            1.0f, 0.0f, stream);
+      residual_add(d_x, d_ffn_out, s * d, stream);
+    }
 
-    // Down projection: [s, d] = [s, intermediate] @ [intermediate, d]
-    sgemm(d_gate, ly.d_down_proj_weight, d_ffn_out, s, d, intermediate_size,
-          1.0f, 0.0f, stream);
-
-    // Second residual: x += ffn_out
-    residual_add(d_x, d_ffn_out, s * d, stream);
+    // Sync and free batch
+    if (stream)
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    else
+      CUDA_CHECK(cudaDeviceSynchronize());
+    for (int l = start; l < end; l++) free_layer(l);
   }
 
   // --- Output layer ---

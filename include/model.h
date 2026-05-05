@@ -53,11 +53,21 @@ class LlamaModel {
   // --- Per-layer weights ---
   std::vector<LlamaLayer> layers;
 
+  // --- Weight directory (for lazy per-layer loading) ---
+  std::string dump_path;
+
   LlamaModel() = default;
   ~LlamaModel();
 
-  /// Load all model weights from dump directory to GPU.
+  /// Load global weights (embeddings, final norm, RoPE) from dump directory.
+  /// Per-layer weights are loaded lazily during forward().
   void load(const std::string& dump_path);
+
+  /// Load a single layer's weights to GPU.
+  void load_layer(int layer_idx);
+
+  /// Free a single layer's weights from GPU.
+  void free_layer(int layer_idx);
 
   /// Free all GPU memory.
   void free_weights();
