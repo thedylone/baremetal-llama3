@@ -72,4 +72,26 @@ class LlamaModel {
   /// @param seq_len     number of tokens
   void forward(const int* d_token_ids, float* d_logits, int seq_len,
                cudaStream_t stream = nullptr);
+
+  /// Full SwiGLU FFN sub-block for a single layer.
+  /// @param x_norm flat [s, hidden_size] host buffer
+  /// @return flat [s, hidden_size] host buffer
+  std::vector<float> swiglu_ffn(const std::vector<float>& x_norm,
+                                int layer_idx, int s,
+                                cudaStream_t stream = nullptr);
+
+  /// Full decoder block for a single layer.
+  /// @param x flat [s, hidden_size] host buffer
+  /// @return flat [s, hidden_size] host buffer
+  std::vector<float> decoder_block(const std::vector<float>& x,
+                                   int layer_idx, int s,
+                                   cudaStream_t stream = nullptr);
+
+  /// Run one full forward pass and return the greedy next token id.
+  int forward_one_step(const std::vector<int>& token_ids,
+                       cudaStream_t stream = nullptr);
+
+  /// Autoregressively generate `n_new` tokens from a prompt.
+  std::vector<int> generate(const std::vector<int>& token_ids, int n_new,
+                            cudaStream_t stream = nullptr);
 };

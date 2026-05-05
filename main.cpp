@@ -41,48 +41,32 @@ int main() {
       chrono::duration<double, milli>(tokenize_t1 - tokenize_t0).count();
   cout << "  Tokenization time: " << tokenize_ms << " ms\n";
 
-  // 3. Upload token ids to GPU
-  int* d_ids;
-  CUDA_CHECK(cudaMalloc(&d_ids, seq_len * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(d_ids, ids.data(), seq_len * sizeof(int),
-                        cudaMemcpyHostToDevice));
-
-  // 4. Forward pass → logits for next token
-  float* d_logits;
-  CUDA_CHECK(cudaMalloc(&d_logits, VOCAB_SIZE * sizeof(float)));
-
-  cout << "Running forward pass...\n";
+  // 3. Generate a few next tokens autoregressively.
+  const int n_new = 8;
+  cout << "Generating " << n_new << " tokens...\n";
   auto forward_t0 = chrono::high_resolution_clock::now();
-  model.forward(d_ids, d_logits, seq_len);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  auto new_ids = model.generate(ids, n_new);
   auto forward_t1 = chrono::high_resolution_clock::now();
   double forward_ms =
       chrono::duration<double, milli>(forward_t1 - forward_t0).count();
-  cout << "  Forward pass: " << forward_ms << " ms\n";
+  cout << "  Generation time: " << forward_ms << " ms\n";
 
-  // 5. Argmax → next token id
-  vector<float> logits(VOCAB_SIZE);
-  CUDA_CHECK(cudaMemcpy(logits.data(), d_logits,
-                        VOCAB_SIZE * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-
-  int next_id = static_cast<int>(max_element(logits.begin(), logits.end()) -
-                                 logits.begin());
-
-  // 6. Decode and print
-  cout << "Decoding next token...\n";
+  // 4. Decode and print tokens as they are generated.
+  cout << "Decoding generated tokens...\n";
   auto decode_t0 = chrono::high_resolution_clock::now();
-  string next_token = tok.decode({next_id});
-  cout << "  Next token id: " << next_id << " -> \"" << next_token << "\"\n";
-  cout << "  Full output: \"" << input << next_token << "\"\n";
+  string output = input;
+  cout << "  Next token ids: ";
+  for (int next_id : new_ids) {
+    string next_token = tok.decode({next_id});
+    cout << next_id << " ";
+    output += next_token;
+  }
+  cout << "\n";
+  cout << "  Full output: \"" << output << "\"\n";
   auto decode_t1 = chrono::high_resolution_clock::now();
   double decode_ms =
       chrono::duration<double, milli>(decode_t1 - decode_t0).count();
   cout << "  Decoding time: " << decode_ms << " ms\n";
-
-  // Cleanup
-  cudaFree(d_ids);
-  cudaFree(d_logits);
 
   auto full_t1 = chrono::high_resolution_clock::now();
   double full_ms = chrono::duration<double, milli>(full_t1 - full_t0).count();

@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "config.h"
 #include "kernels.cuh"
@@ -75,6 +76,19 @@ void safe_free(float*& ptr) {
   }
 }
 
+int argmax_index(const std::vector<float>& values) {
+  if (values.empty()) return 0;
+  int best_idx = 0;
+  float best_val = values[0];
+  for (int i = 1; i < static_cast<int>(values.size()); ++i) {
+    if (values[i] > best_val) {
+      best_val = values[i];
+      best_idx = i;
+    }
+  }
+  return best_idx;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -102,7 +116,8 @@ void LlamaModel::load(const std::string& path) {
   size_t rope_bytes = MAX_SEQ_LEN * (HEAD_DIM / 2) * sizeof(float);
   CUDA_CHECK(cudaMalloc(&d_rope_cos, rope_bytes));
   CUDA_CHECK(cudaMalloc(&d_rope_sin, rope_bytes));
-  rope_precompute(d_rope_cos, d_rope_sin, MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA_BASE);
+  rope_precompute(d_rope_cos, d_rope_sin, MAX_SEQ_LEN, HEAD_DIM,
+                  ROPE_THETA_BASE);
 
   // Per-layer weights are loaded lazily during forward()
   layers.resize(NUM_LAYERS);
@@ -115,8 +130,8 @@ void LlamaModel::load_layer(int l) {
 
   ly.d_input_layernorm_weight =
       upload_1d(loader, p + "input_layernorm_weight.bin", EMBEDDING_DIM);
-  ly.d_post_attention_layernorm_weight =
-      upload_1d(loader, p + "post_attention_layernorm_weight.bin", EMBEDDING_DIM);
+  ly.d_post_attention_layernorm_weight = upload_1d(
+      loader, p + "post_attention_layernorm_weight.bin", EMBEDDING_DIM);
 
   ly.d_q_proj_weight = upload_2d_T(loader, p + "self_attn_q_proj_weight.bin",
                                    EMBEDDING_DIM, EMBEDDING_DIM);
@@ -254,6 +269,169 @@ void LlamaModel::forward(const int* d_token_ids, float* d_logits, int seq_len,
   cudaFree(d_gate);
   cudaFree(d_up);
   cudaFree(d_ffn_out);
+}
+
+std::vector<float> LlamaModel::swiglu_ffn(const std::vector<float>& x_norm,
+                                          int layer_idx, int s,
+                                          cudaStream_t stream) {
+  if (layer_idx < 0 || layer_idx >= static_cast<int>(layers.size())) return {};
+  if (layers[layer_idx].d_gate_proj_weight == nullptr) load_layer(layer_idx);
+
+  std::vector<float> output(static_cast<size_t>(s) * EMBEDDING_DIM, 0.0f);
+
+  float *d_x_norm, *d_gate, *d_up, *d_out;
+  CUDA_CHECK(cudaMalloc(&d_x_norm, x_norm.size() * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(
+      &d_gate, static_cast<size_t>(s) * INTERMEDIATE_SIZE * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(
+      &d_up, static_cast<size_t>(s) * INTERMEDIATE_SIZE * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(
+      &d_out, static_cast<size_t>(s) * EMBEDDING_DIM * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(d_x_norm, x_norm.data(), x_norm.size() * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  sgemm(d_x_norm, layers[layer_idx].d_gate_proj_weight, d_gate, s,
+        INTERMEDIATE_SIZE, EMBEDDING_DIM, 1.0f, 0.0f, stream);
+  sgemm(d_x_norm, layers[layer_idx].d_up_proj_weight, d_up, s,
+        INTERMEDIATE_SIZE, EMBEDDING_DIM, 1.0f, 0.0f, stream);
+
+  silu(d_gate, d_up, s * INTERMEDIATE_SIZE, stream);
+
+  sgemm(d_gate, layers[layer_idx].d_down_proj_weight, d_out, s, EMBEDDING_DIM,
+        INTERMEDIATE_SIZE, 1.0f, 0.0f, stream);
+
+  if (stream)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  else
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(output.data(), d_out, output.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  cudaFree(d_x_norm);
+  cudaFree(d_gate);
+  cudaFree(d_up);
+  cudaFree(d_out);
+  return output;
+}
+
+std::vector<float> LlamaModel::decoder_block(const std::vector<float>& x,
+                                             int layer_idx, int s,
+                                             cudaStream_t stream) {
+  if (layer_idx < 0 || layer_idx >= static_cast<int>(layers.size())) return {};
+  if (layers[layer_idx].d_q_proj_weight == nullptr) load_layer(layer_idx);
+
+  const int d = EMBEDDING_DIM;
+  std::vector<float> output(x.size(), 0.0f);
+
+  float *d_x, *d_normed, *d_q, *d_k, *d_v, *d_attn_out;
+  float *d_gate, *d_up, *d_ffn_out;
+  CUDA_CHECK(cudaMalloc(&d_x, x.size() * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_normed, x.size() * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_q, static_cast<size_t>(s) * d * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_k, static_cast<size_t>(s) * KV_DIM * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_v, static_cast<size_t>(s) * KV_DIM * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_attn_out, x.size() * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(
+      &d_gate, static_cast<size_t>(s) * INTERMEDIATE_SIZE * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(
+      &d_up, static_cast<size_t>(s) * INTERMEDIATE_SIZE * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_ffn_out, x.size() * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  rms_norm(d_x, layers[layer_idx].d_input_layernorm_weight, d_normed, s, d,
+           stream);
+  sgemm(d_normed, layers[layer_idx].d_q_proj_weight, d_q, s, d, d, 1.0f, 0.0f,
+        stream);
+  sgemm(d_normed, layers[layer_idx].d_k_proj_weight, d_k, s, KV_DIM, d, 1.0f,
+        0.0f, stream);
+  sgemm(d_normed, layers[layer_idx].d_v_proj_weight, d_v, s, KV_DIM, d, 1.0f,
+        0.0f, stream);
+
+  rope_apply(d_q, d_rope_cos, d_rope_sin, s, NUM_HEADS, HEAD_DIM, stream);
+  rope_apply(d_k, d_rope_cos, d_rope_sin, s, NUM_KV_HEADS, HEAD_DIM, stream);
+
+  gqa_attention(d_q, d_k, d_v, d_attn_out, s, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+                stream);
+
+  sgemm(d_attn_out, layers[layer_idx].d_o_proj_weight, d_normed, s, d, d, 1.0f,
+        0.0f, stream);
+  residual_add(d_x, d_normed, s * d, stream);
+
+  rms_norm(d_x, layers[layer_idx].d_post_attention_layernorm_weight, d_normed,
+           s, d, stream);
+  sgemm(d_normed, layers[layer_idx].d_gate_proj_weight, d_gate, s,
+        INTERMEDIATE_SIZE, d, 1.0f, 0.0f, stream);
+  sgemm(d_normed, layers[layer_idx].d_up_proj_weight, d_up, s,
+        INTERMEDIATE_SIZE, d, 1.0f, 0.0f, stream);
+  silu(d_gate, d_up, s * INTERMEDIATE_SIZE, stream);
+  sgemm(d_gate, layers[layer_idx].d_down_proj_weight, d_ffn_out, s, d,
+        INTERMEDIATE_SIZE, 1.0f, 0.0f, stream);
+  residual_add(d_x, d_ffn_out, s * d, stream);
+
+  if (stream)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  else
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(output.data(), d_x, output.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  cudaFree(d_x);
+  cudaFree(d_normed);
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_attn_out);
+  cudaFree(d_gate);
+  cudaFree(d_up);
+  cudaFree(d_ffn_out);
+  return output;
+}
+
+int LlamaModel::forward_one_step(const std::vector<int>& token_ids,
+                                 cudaStream_t stream) {
+  if (token_ids.empty()) return 0;
+
+  std::vector<float> logits(VOCAB_SIZE, 0.0f);
+  int* d_ids = nullptr;
+  float* d_logits = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_ids, token_ids.size() * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_logits, VOCAB_SIZE * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(d_ids, token_ids.data(), token_ids.size() * sizeof(int),
+                        cudaMemcpyHostToDevice));
+  forward(d_ids, d_logits, static_cast<int>(token_ids.size()), stream);
+
+  if (stream)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  else
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  cudaFree(d_ids);
+  cudaFree(d_logits);
+  return argmax_index(logits);
+}
+
+std::vector<int> LlamaModel::generate(const std::vector<int>& token_ids,
+                                      int n_new, cudaStream_t stream) {
+  std::vector<int> prompt = token_ids;
+  std::vector<int> generated;
+  generated.reserve(n_new);
+
+  for (int i = 0; i < n_new; ++i) {
+    int next_id = forward_one_step(prompt, stream);
+    generated.push_back(next_id);
+    prompt.push_back(next_id);
+  }
+
+  return generated;
 }
 
 void LlamaModel::free_weights() {
