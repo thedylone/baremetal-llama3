@@ -66,26 +66,17 @@ class LlamaModel {
   void embed(const int* d_token_ids, float* d_output, int seq_len,
              cudaStream_t stream = nullptr);
 
-  /// Run full forward pass: embed → 32 decoder layers → final norm → logits.
-  /// @param d_token_ids [seq_len] int array on device
-  /// @param d_logits    [vocab_size] float array on device (output, last token)
-  /// @param seq_len     number of tokens
-  void forward(const int* d_token_ids, float* d_logits, int seq_len,
-               cudaStream_t stream = nullptr);
-
   /// Full SwiGLU FFN sub-block for a single layer.
   /// @param x_norm flat [s, hidden_size] host buffer
   /// @return flat [s, hidden_size] host buffer
-  std::vector<float> swiglu_ffn(const std::vector<float>& x_norm,
-                                int layer_idx, int s,
-                                cudaStream_t stream = nullptr);
+  std::vector<float> swiglu_ffn(const std::vector<float>& x_norm, int layer_idx,
+                                int s, cudaStream_t stream = nullptr);
 
   /// Full decoder block for a single layer.
   /// @param x flat [s, hidden_size] host buffer
   /// @return flat [s, hidden_size] host buffer
-  std::vector<float> decoder_block(const std::vector<float>& x,
-                                   int layer_idx, int s,
-                                   cudaStream_t stream = nullptr);
+  std::vector<float> decoder_block(const std::vector<float>& x, int layer_idx,
+                                   int s, cudaStream_t stream = nullptr);
 
   /// Run one full forward pass and return the greedy next token id.
   int forward_one_step(const std::vector<int>& token_ids,
@@ -94,4 +85,48 @@ class LlamaModel {
   /// Autoregressively generate `n_new` tokens from a prompt.
   std::vector<int> generate(const std::vector<int>& token_ids, int n_new,
                             cudaStream_t stream = nullptr);
+
+ private:
+  /// SwiGLU FFN computation with pre-allocated buffers.
+  /// Computes: gate = x_norm @ W_gate, up = x_norm @ W_up,
+  ///           hidden = silu(gate) * up, out = hidden @ W_down
+  /// @param layer_idx   layer index
+  /// @param seq_len     sequence length
+  /// @param d_x_norm    [seq_len, hidden_size] input (pre-normed activations)
+  /// @param d_gate      [seq_len, intermediate_size] scratch buffer (output
+  /// gate projection)
+  /// @param d_up        [seq_len, intermediate_size] scratch buffer (output up
+  /// projection)
+  /// @param d_out       [seq_len, hidden_size] scratch buffer (output)
+  void swiglu_ffn_internal(int layer_idx, int seq_len, const float* d_x_norm,
+                           float* d_gate, float* d_up, float* d_out,
+                           cudaStream_t stream);
+
+  /// Full decoder layer with pre-allocated buffers.
+  /// Implements: attention block (with residual) → FFN block (with residual)
+  /// @param layer_idx   layer index
+  /// @param seq_len     sequence length
+  /// @param d_x         [seq_len, hidden_size] input/output (updated in-place
+  /// after layer)
+  /// @param d_normed    [seq_len, hidden_size] scratch (post-norm activation)
+  /// @param d_q, d_k, d_v, d_attn_out, d_gate, d_up, d_ffn_out: all
+  /// pre-allocated
+  void decoder_layer_internal(int layer_idx, int seq_len, float* d_x,
+                              float* d_normed, float* d_q, float* d_k,
+                              float* d_v, float* d_attn_out, float* d_gate,
+                              float* d_up, float* d_ffn_out,
+                              cudaStream_t stream);
+
+  /// Internal forward pass with pre-allocated scratch buffers.
+  /// Computes: embed → 32 decoder layers → final norm → logits.
+  /// Reuses caller-provided scratch buffers to avoid repeated allocations.
+  /// @param d_token_ids [seq_len] int array on device
+  /// @param d_logits    [vocab_size] float array on device (output)
+  /// @param seq_len     number of tokens in sequence
+  /// @param d_x, d_normed, d_q, d_k, d_v, d_attn_out, d_gate, d_up, d_ffn_out:
+  /// pre-allocated scratch buffers
+  void forward_internal(const int* d_token_ids, float* d_logits, int seq_len,
+                        float* d_x, float* d_normed, float* d_q, float* d_k,
+                        float* d_v, float* d_attn_out, float* d_gate,
+                        float* d_up, float* d_ffn_out, cudaStream_t stream);
 };
