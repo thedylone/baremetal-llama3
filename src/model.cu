@@ -252,9 +252,8 @@ void LlamaModel::forward_internal(const int* d_token_ids, float* d_logits,
   embed(d_token_ids, d_x, seq_len, stream);
 
   // --- 32 decoder layers (load in batches to reduce disk I/O) ---
-  const int batch = NUM_LAYERS / 32;  // 1 layer per batch (since NUM_LAYERS=32)
-  for (int start = 0; start < NUM_LAYERS; start += batch) {
-    int end = std::min(start + batch, NUM_LAYERS);
+  for (int start = 0; start < NUM_LAYERS; start += LAZY_LOAD_BATCH_SIZE) {
+    int end = std::min(start + LAZY_LOAD_BATCH_SIZE, NUM_LAYERS);
 
     // Load batch of layers
     for (int l = start; l < end; l++) load_layer(l);
@@ -270,7 +269,8 @@ void LlamaModel::forward_internal(const int* d_token_ids, float* d_logits,
       CUDA_CHECK(cudaStreamSynchronize(stream));
     else
       CUDA_CHECK(cudaDeviceSynchronize());
-    for (int l = start; l < end; l++) free_layer(l);
+    if (!LAZY_LOAD_KEEP_LAYERS)
+      for (int l = start; l < end; l++) free_layer(l);
   }
 
   // --- Output layer ---

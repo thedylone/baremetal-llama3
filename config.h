@@ -18,3 +18,6 @@ const int KV_DIM = 1024;   // NUM_KV_HEADS * HEAD_DIM
 const int INTERMEDIATE_SIZE = 14336;
 const int VOCAB_SIZE = 128256;
 const int MAX_SEQ_LEN = 1000;
+
+const int LAZY_LOAD_BATCH_SIZE = 1;
+const bool LAZY_LOAD_KEEP_LAYERS = false;
