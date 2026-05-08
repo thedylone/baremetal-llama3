@@ -125,7 +125,7 @@ void LlamaModel::load(const std::string& path) {
 }
 
 void LlamaModel::load_layer(int l) {
-  LlamaDumpLoader loader(DumpFloatType::FP32);
+  LlamaDumpLoader loader(DumpFloatType::BF16);
   std::string p = dump_path + "/model_layers_" + std::to_string(l) + "_";
   LlamaLayer& ly = layers[l];
 

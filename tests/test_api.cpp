@@ -53,7 +53,7 @@ string TestAPI::detokenize(vector<int> token_ids) {
 }
 
 vector<float> TestAPI::get_embeddings(vector<int> token_ids) {
-  LlamaDumpLoader loader(DumpFloatType::FP32);
+  LlamaDumpLoader loader(DumpFloatType::BF16);
   if (!loader.load_embeddings("assets/llama3/dumped", 4096)) {
     throw runtime_error("Failed to load embeddings");
   }
