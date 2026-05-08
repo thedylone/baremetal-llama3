@@ -139,7 +139,6 @@ Fine‑grained tokenization (subwords/bytes) trades vocabulary size for sequence
 - **Lower precision / compression**: fewer bytes read; decompress on GPU.
 - **Parallel I/O**: shard weights and load in parallel threads/processes.
 
-
 # Milestone 2
 
 ## Roofline analysis
@@ -147,7 +146,9 @@ Fine‑grained tokenization (subwords/bytes) trades vocabulary size for sequence
 > Before you run Nsight Compute (ncu), predict: is your RMSNorm kernel memory-bandwidth-bound or compute-bound? Estimate its arithmetic intensity in FLOPs per byte, assuming all data comes from HBM. Then profile it and compare your prediction to the measured roofline position. Do the same for your matmul kernel. Are the results what you expected?
 
 ### RMSNorm
+
 The RMSNorm kernel computes
+
 $$
     \mathrm{RMS}(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}, \quad \mathrm{RMSNorm}(x) = \frac{x}{\mathrm{RMS}(x)} \odot \gamma
 $$
@@ -156,7 +157,7 @@ The FLOP count for this kernel is:
 Step | FLOPs
 --- | ---
 Squaring each element | $d$
-Accumulating the sum  | $d$
+Accumulating the sum | $d$
 Divide by N, add $\epsilon$, sqrt, reciprocal | ~4
 Normalisation $x_i \times$ inv_rms | $d$
 Scaling by $\gamma$ | $d$
@@ -182,12 +183,14 @@ Using NCU metrics for `s=4096, d=4096`:
 - `FADD = 1,048,576`, `FMUL = 33,554,432`, `FFMA = 16,797,696`
 
 Compute:
+
 - **Bytes** = 130.72 + 66.96 = **197.68 MB**
 - **FLOPs** = FADD + FMUL + 2·FFMA  
   = 1,048,576 + 33,554,432 + 2·16,797,696  
   = **68,198,400 FLOPs**
 
 Roofline point:
+
 - **Arithmetic intensity** = 68,198,400 / 197.68e6 = **0.345 FLOPs/byte**
 - **Performance** = 68,198,400 / 629.66e-6 = **~108 GFLOP/s**
 - **Bandwidth** = 197.68e6 / 629.66e-6 = **~314 GB/s**
@@ -196,15 +199,17 @@ This uses **DRAM bytes**, so cache hits reduce the observed traffic vs the
 theoretical 16d/row model.
 
 ### matmul
+
 For the `sgemm_register_tiled_kernel`, with `BM = BN = 64` and `BK = 32`,
+
 - FLOPs per block:
-    - There are $BM \times BN \times BK$ multiplications and the same number of additions, so total FLOPs is:
-    - $ 2 \times BM \times BN \times BK = 2 \times 64 \times 64 \times 32 = 262144 $ FLOPs per block
+  - There are $BM \times BN \times BK$ multiplications and the same number of additions, so total FLOPs is:
+  - $ 2 \times BM \times BN \times BK = 2 \times 64 \times 64 \times 32 = 262144 $ FLOPs per block
 - HBM bytes per block, assuming ideal reuse inside shared/registers:
-    - Read A: $4 \times BM \times BK = 8192$ bytes
-    - Read B: $4 \times BK \times BN = 8192$ bytes
-    - Write C: $4 \times BM \times BN = 16384$ bytes
-    - Total HBM bytes: $8192 + 8192 + 16384 = 32768$ bytes per block
+  - Read A: $4 \times BM \times BK = 8192$ bytes
+  - Read B: $4 \times BK \times BN = 8192$ bytes
+  - Write C: $4 \times BM \times BN = 16384$ bytes
+  - Total HBM bytes: $8192 + 8192 + 16384 = 32768$ bytes per block
 
 So the arithmetic intensity is approximately $\frac{262144}{32768} = 8$ FLOPs/Byte, which is much higher than the RMSNorm kernel, indicating that the matmul kernel is more compute-bound.
 
@@ -216,6 +221,7 @@ NCU metrics for 4096×4096×4096:
 - `FFMA = 68,736,253,952`
 
 Compute:
+
 - **Bytes** = 4.50 + 0.07661 = **4.57661 GB**
 - **FLOPs** = 2·FFMA = **137,472,507,904**
 - **AI** = 137,472,507,904 / 4.57661e9 = **30.05 FLOPs/byte**
@@ -230,7 +236,7 @@ This exceeds the expected performance based on the theoretical arithmetic intens
 
 The total HBM traffic for the RMSNorm kernel is $2 \times 4d + 4d + 4d = 16d = 65536$ bytes (reads each input twice, reads $\gamma$ once, and writes output once) per row.
 
-> If you could restructure the kernel to keep the row in shared memory between both passes, how much HBM traffic would you save? 
+> If you could restructure the kernel to keep the row in shared memory between both passes, how much HBM traffic would you save?
 
 This would save the second read of the input row, which is $4d$ bytes. So the HBM traffic would be reduced to $12d$ bytes, saving 25% of the original traffic.
 
@@ -250,9 +256,67 @@ If $X_{norm}$ fit entirely in the L2 cache after the first read, the effective m
 
 > Given the L2 size on your GPU, does $X_{norm}$ actually fit?
 
-The A100 GPU on the cluster has an L2 cache size of 40 MB. For $X_{norm}$ to fit in the L2 cache, we need:
-$$4 \times s \times d \leq 40 \text{ MB} \implies 4096 s \leq 10^7 $$
-$$ s \leq \frac{10^7}{4096} \approx 2441 $$
-So if the sequence length $s$ is less than or equal to 2441, $X_{norm}$ would fit in the L2 cache. For typical sequence lengths used in LLM inference (e.g., 512, 1024, 2048), $X_{norm}$ would indeed fit in the L2 cache on an A100 GPU.
+The L4 GPU on the cluster has an L2 cache size of 48 MB. For $X_{norm}$ to fit in the L2 cache, we need:
+$$4 \times s \times d \leq 48 \text{ MB} \implies 16384 s \leq 4.8 \times 10^7 $$
+$$ s \leq \frac{4.8 \times 10^7}{16384} \approx 2930 $$
+So if the sequence length $s$ is less than or equal to 2930, $X_{norm}$ would fit in the L2 cache. For typical sequence lengths used in LLM inference (e.g., 512, 1024, 2048), $X_{norm}$ would indeed fit in the L2 cache on an A100 GPU.
 
 On my laptop with an NVIDIA GeForce RTX 3060 Laptop GPU, which has an L2 cache size of 3 MB, the maximum sequence length for $X_{norm}$ to fit in the L2 cache would be approximately 183 tokens, which is quite small. Therefore, for longer sequences, $X_{norm}$ would not fit in the L2 cache on the laptop, and the subsequent reads for K and V would go to HBM, resulting in higher effective memory traffic.
+
+# Milestone 3
+
+## Forward Pass nsys
+
+> Profile one complete forward pass with NVIDIA Nsight Systems (nsys). Look at the kernel execution timeline across all 32 layers and identify which operator dominates wall time. Then double s and profile again. Which operator grows faster with sequence length and why? What does this tell you about the practical bottleneck of inference without KV caching?
+
+| kernel          | $s=25$ | $s=50$ | $s=234$ |
+| --------------- | ------ | ------ | ------- |
+| sgemm           | 88.8%  | 88.0%  | 83.7%   |
+| score           | 7.2%   | 7.2%   | 10.2%   |
+| softmax         | 1.5%   | 1.5%   | 1.0%    |
+| output          | 1.2%   | 1.9%   | 3.2%    |
+| causal          | 0.6%   | 0.6%   | 0.4%    |
+| rms_norm        | 0.3%   | 0.4%   | 0.3%    |
+| silu            | 0.1%   | 0.2%   | 0.7%    |
+| residual_add    | 0.1%   | 0.1%   | 0.4%    |
+| rope_apply      | <0.1%  | 0.1%   | 0.2%    |
+| embedding       | <0.1%  | <0.1%  | <0.1%   |
+| rope_precompute | <0.1%  | <0.1%  | <0.1%   |
+
+The `score` and `output` kernels increase in proportion of total time as the sequence length increases.
+
+For short sequences, the matmul (sgemm) dominates because $s << d$, so the attention score computation and output projection are relatively cheap.
+
+For long sequences, $s >> d$, attention becomes $O(s^2)$ while matmul is $O(s\cdot d^2) = O(s)$, so the score computation and output projection grow faster with sequence length. This indicates that without KV caching, the attention mechanism becomes the practical bottleneck for inference as sequence length increases, due to its quadratic scaling with $s$.
+
+## Attention score matrix
+
+> The attention score matrix $S_i \in \mathbb{R}^{s \times s}$ is materialized in GPU memory for each of the $h = 32$ heads. What is the total memory required to hold all 32 score matrices at once for $s = 512$ in FP32?
+
+Each attention score matrix $S_i$ has dimensions $s \times s$, so for $s = 512$, each matrix has $512 \times 512 = 262,144$ elements. Since each element is stored in FP32 format, which requires 4 bytes, the memory required for one score matrix is:
+$$262,144 \text{ elements} \times 4 \text{ bytes/element} = 1,048,576 \text{ bytes} = 1 \text{ MB}$$
+Therefore, the total memory required to hold all 32 score matrices at once is:
+$$32 \times 1 \text{ MB} = 32 \text{ MB}$$
+
+> How does this scale with $s$?
+
+This is quadratic scaling in $s$. $128\,s^2$ bytes are required.
+
+> At what sequence length does the score matrix memory exceed the size of all model weights combined?
+
+Size of all model weights = 32 GB for FP32. The score matrix memory exceeds this when:
+$$128\,s^2 > 32.121 \times 10^9 \implies s > 15,841$$
+
+##
+
+> Without KV caching, generating $T$ new tokens from a prompt of length $s_0$ requires $T$ full forward passes on sequences of length $s_0 +1, s_0 +2, \dots , s_0 + T$. How does the total number of floating-point operations scale with $T$ compared to a system that caches K and V and only processes one new token per step? What does this imply about the latency of your implementation as $T$ grows large?
+
+Let $F(s)$ be the number of FLOPs for a forward pass on a sequence of length $s$. Without KV caching, the total FLOPs for generating $T$ new tokens is:
+$$\sum_{t=1}^{T} F(s_0 + t)$$
+Assuming $F(s)$ scales linearly with $s$ (due to the attention mechanism), we have:
+$$F(t) \propto (s_0 + t)$$
+Thus, the total FLOPs without KV caching scales as:
+$$\sum_{t=1}^{T} (s_0 + t) = T \cdot s_0 + \frac{T(T+1)}{2}$$
+This means the total FLOPs scale as $O(T^2)$ for large $T$.
+
+With KV caching, each new token only requires processing one new token with the cached K and V, so the FLOPs for each new token is constant (assuming the attention mechanism can be optimized to only compute the necessary parts). Thus, the total FLOPs with KV caching scales as $O(T)$.
