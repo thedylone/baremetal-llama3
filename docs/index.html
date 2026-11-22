@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bare-metal Llama 3</title>
+  <meta name="description" content="A from-scratch C++/CUDA inference engine for Llama-3-8B-Instruct: mmap'd weights, hand-written kernels for RMSNorm, SGEMM, RoPE, grouped-query attention and SwiGLU, and an autoregressive decoding loop. Harvard CS 265.">
+  <meta property="og:title" content="Bare-metal Llama 3">
+  <meta property="og:description" content="A from-scratch C++/CUDA inference engine for Llama-3-8B-Instruct with hand-written CUDA kernels.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://projects.thedylone.com/baremetal-llama3/">
+  <meta property="og:image" content="https://projects.thedylone.com/baremetal-llama3/gallery-cover.webp">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e2f4d'/%3E%3Cpath d='M8 22V10h3l5 7 5-7h3v12h-3v-7l-5 7-5-7v7z' fill='%23b8860b'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a href="https://projects.thedylone.com/">&larr; All projects</a>
+    <nav aria-label="Sections">
+      <a class="hide-sm" href="#architecture">Architecture</a>
+      <a class="hide-sm" href="#kernels">Kernels</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="https://github.com/thedylone/baremetal-llama3">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <div class="hero">
+      <span class="label">Harvard CS 265 &middot; Systems project</span>
+      <h1>Bare-metal <em>Llama&nbsp;3</em></h1>
+      <p class="lede">An inference engine for Llama-3-8B-Instruct written from scratch in C++17 and CUDA. No PyTorch and no cuBLAS at runtime: every operator in the forward pass, from the embedding lookup to the final logits, is a hand-written kernel.</p>
+      <ul class="tags">
+        <li class="tag">C++17</li>
+        <li class="tag">CUDA</li>
+        <li class="tag">Llama-3-8B-Instruct</li>
+        <li class="tag">FP32 compute</li>
+        <li class="tag">Nsight Systems / Compute</li>
+      </ul>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/thedylone/baremetal-llama3">View the code on GitHub</a>
+        <a class="btn btn-ghost" href="#benchmarks">Jump to benchmarks</a>
+      </div>
+
+      <div class="stats" aria-label="Model configuration">
+        <div class="stat"><b>32</b><span>Decoder layers</span></div>
+        <div class="stat"><b>4,096</b><span>Hidden dim</span></div>
+        <div class="stat"><b>32 / 8</b><span>Q / KV heads (GQA)</span></div>
+        <div class="stat"><b>14,336</b><span>FFN width</span></div>
+        <div class="stat"><b>128,256</b><span>Vocab size</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= OVERVIEW ================= -->
+  <section id="overview">
+    <div class="wrap">
+      <span class="label">01 &middot; Overview</span>
+      <h2>What it is</h2>
+      <div class="grid-2">
+        <div>
+          <p>The project rebuilds the Llama-3-8B-Instruct forward pass at the level of raw device pointers. A Python dumper converts the HuggingFace safetensors checkpoint into a simple per-tensor binary format; the C++ side memory-maps those files, converts BF16 to FP32, uploads to the GPU and runs the model through its own CUDA kernels.</p>
+          <p>A byte-level BPE tokenizer (also C++) handles encoding and decoding, and a greedy decoding loop generates tokens one at a time by taking the argmax over the 128,256-entry logits.</p>
+        </div>
+        <div>
+          <p>Correctness is checked operator by operator. Reference fixtures are generated from PyTorch implementations (<code>reference.py</code>, <code>tools/generate_*_reference.py</code>), and an 18-case test suite compares the CUDA path against them: tokenization, embeddings, matmul, RMSNorm, RoPE, GQA, residual add, SiLU gating, the SwiGLU FFN, a full decoder block, a single forward step and multi-token generation.</p>
+          <p>The work was profiled with Nsight Systems and Nsight Compute, and the reports' findings are on this page.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ARCHITECTURE ================= -->
+  <section id="architecture">
+    <div class="wrap">
+      <span class="label">02 &middot; Architecture</span>
+      <h2>From checkpoint to <em>next token</em></h2>
+      <p class="section-intro">The pipeline has four stages: getting weights onto the GPU, then the decoding loop that runs the 32-layer stack once per generated token.</p>
+
+      <ol class="pipeline">
+        <li><div class="card">
+          <h3>Dump</h3>
+          <p><code>tools/dumper.py</code> writes each safetensors tensor to its own <code>.bin</code> file (magic number, name, shape, dtype, raw BF16 bytes) plus a <code>metadata.json</code> index.</p>
+        </div></li>
+        <li><div class="card">
+          <h3>mmap</h3>
+          <p>An RAII <code>MappedFile</code> class <code>mmap</code>s each tensor read-only and unmaps it when it goes out of scope. BF16 values become FP32 with a 16-bit shift on the CPU.</p>
+        </div></li>
+        <li><div class="card">
+          <h3>Upload</h3>
+          <p>Projection matrices are transposed on the CPU to <code>[in,&nbsp;out]</code> layout and copied to device memory. The embedding table, final norm and LM head are uploaded once at load time.</p>
+        </div></li>
+        <li><div class="card">
+          <h3>Decode</h3>
+          <p>For each new token, run the forward pass over the whole sequence, take the argmax of the last position's logits, append it and repeat. RoPE cos/sin tables are precomputed on the GPU for up to 1,000 positions.</p>
+        </div></li>
+      </ol>
+
+      <div class="card loop">
+        <span class="label">One decoder layer, as launched</span>
+        <ul class="layer-ops" aria-label="Kernel sequence for one decoder layer">
+          <li>rms_norm</li><li class="arrow">&rarr;</li>
+          <li class="k-gemm">sgemm Q</li><li class="k-gemm">sgemm K</li><li class="k-gemm">sgemm V</li><li class="arrow">&rarr;</li>
+          <li>rope_apply Q,K</li><li class="arrow">&rarr;</li>
+          <li class="k-attn">score</li><li class="k-attn">causal_mask</li><li class="k-attn">softmax</li><li class="k-attn">output</li><li class="arrow">&rarr;</li>
+          <li class="k-gemm">sgemm O</li><li class="arrow">&rarr;</li>
+          <li>residual_add</li><li class="arrow">&rarr;</li>
+          <li>rms_norm</li><li class="arrow">&rarr;</li>
+          <li class="k-gemm">sgemm gate</li><li class="k-gemm">sgemm up</li><li class="arrow">&rarr;</li>
+          <li>silu &times; up</li><li class="arrow">&rarr;</li>
+          <li class="k-gemm">sgemm down</li><li class="arrow">&rarr;</li>
+          <li>residual_add</li>
+        </ul>
+        <p style="margin-top:14px;font-size:0.93rem;color:var(--text-2)">After the 32 layers come a final <code>rms_norm</code> and a single-row <code>sgemm</code> against the LM head (<code>[1,&nbsp;4096] &times; [4096,&nbsp;128256]</code>) for the last position only. The four attention kernels run once per query head, and each KV head is shared by four query heads.</p>
+      </div>
+
+      <div class="grid-2" style="margin-top:18px">
+        <div class="card">
+          <span class="label">Lazy layer loading</span>
+          <p>Per-layer weights are not held on the GPU permanently. <code>forward()</code> loads a batch of layers (<code>LAZY_LOAD_BATCH_SIZE</code>, default 1), runs them, synchronises and frees them unless <code>LAZY_LOAD_KEEP_LAYERS</code> is set. The full FP32 model, about 32&nbsp;GB, never has to be resident at once. The cost is re-reading weights on every step.</p>
+        </div>
+        <div class="card">
+          <span class="label">No KV cache, by design</span>
+          <p>Each step recomputes K and V for the entire prefix. Scratch buffers are preallocated once for the maximum sequence length and reused across steps. The report works out the consequence: generating <i>T</i> tokens costs <i>O(T&sup2;)</i> total work without caching, against <i>O(T)</i> with it.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= KERNELS ================= -->
+  <section id="kernels">
+    <div class="wrap">
+      <span class="label">03 &middot; CUDA kernels</span>
+      <h2>The kernels</h2>
+      <p class="section-intro">Every kernel is FP32 and written by hand. The main techniques are shared-memory tiling, tree reductions in shared memory, register blocking, and keeping each warp's global loads contiguous.</p>
+
+      <div class="grid-2" style="margin-top:24px">
+        <article class="card kernel span-2">
+          <h3>SGEMM <small>src/gemm.cu &middot; three variants</small></h3>
+          <p>All seven projections per layer, and the LM head, go through one <code>sgemm(A, B, C, M, N, K, &alpha;, &beta;)</code> entry point. It currently dispatches to the fastest of three implementations, each checked against a CPU reference in <code>benchmarks/benchmark_gemm.cu</code>.</p>
+          <div class="grid-3" style="margin-top:12px">
+            <div>
+              <span class="label">Naive</span>
+              <ul><li>One thread per output element, 32&times;32 blocks.</li><li>Every operand comes straight from global memory.</li></ul>
+            </div>
+            <div>
+              <span class="label">Shared-memory tiled</span>
+              <ul><li>32&times;32 output tile per block, K walked in 32-wide tiles.</li><li>Adjacent threads load adjacent columns, so tile loads are coalesced.</li></ul>
+            </div>
+            <div>
+              <span class="label">Register-tiled &middot; in use</span>
+              <ul><li>64&times;64 block tile, BK&nbsp;=&nbsp;32, 64 threads.</li><li>Each thread keeps an 8&times;8 accumulator in registers and does an outer product per k-step.</li></ul>
+            </div>
+          </div>
+<pre><code><span class="c">// inner loop of sgemm_register_tiled_kernel (BM=BN=64, BK=32, TM=TN=8)</span>
+<span class="k">for</span> (int k = 0; k &lt; BK; ++k) {
+  <span class="k">for</span> (int i = 0; i &lt; TM; ++i) rA[i] = sA[ty * TM + i][k];
+  <span class="k">for</span> (int j = 0; j &lt; TN; ++j) rB[j] = sB[k][tx * TN + j];
+  <span class="k">for</span> (int i = 0; i &lt; TM; ++i)
+    <span class="k">for</span> (int j = 0; j &lt; TN; ++j) acc[i][j] += rA[i] * rB[j];
+}</code></pre>
+        </article>
+
+        <article class="card kernel">
+          <h3>RMSNorm <small>src/rms_norm.cu</small></h3>
+          <ul>
+            <li>One 256-thread block per row; threads stride across <i>d</i>&nbsp;=&nbsp;4096.</li>
+            <li>Per-thread partial sums of <i>x&sup2;</i> are combined with a shared-memory tree reduction.</li>
+            <li>Thread 0 computes <code>rsqrtf(mean + &epsilon;)</code> and broadcasts it through shared memory. A second pass applies <i>x &middot; inv_rms &middot; &gamma;</i>.</li>
+            <li>Reading the row twice costs 16<i>d</i> bytes of HBM traffic per row. The report estimates that keeping the row in shared memory would cut 25% of that.</li>
+          </ul>
+        </article>
+
+        <article class="card kernel">
+          <h3>Grouped-query attention <small>src/attention.cu</small></h3>
+          <ul>
+            <li>32 query heads map onto 8 KV heads (<code>g = i / 4</code>), so no K/V data is duplicated.</li>
+            <li><b>score</b>: a 16&times;16 thread grid, one dot product of length 128 per (query, key), scaled by 1/&radic;128.</li>
+            <li><b>causal_mask</b>: sets entries above the diagonal to a large negative value.</li>
+            <li><b>softmax</b>: one block per row. A shared-memory max reduction, then exp and a sum reduction, give a numerically stable result.</li>
+            <li><b>output</b>: <i>a<sub>i</sub>V</i> written directly into the concatenated head layout.</li>
+          </ul>
+        </article>
+
+        <article class="card kernel">
+          <h3>SwiGLU FFN <small>src/silu.cu + sgemm</small></h3>
+          <ul>
+            <li>Gate and up projections (4096&nbsp;&rarr;&nbsp;14,336) are two SGEMMs.</li>
+            <li>A fused element-wise kernel computes <code>silu(gate) * up</code> in place, which saves a separate multiply pass.</li>
+            <li>The down projection (14,336&nbsp;&rarr;&nbsp;4096) is the third SGEMM.</li>
+          </ul>
+        </article>
+
+        <article class="card kernel">
+          <h3>RoPE, embedding, residual <small>src/rope.cu &middot; model.cu</small></h3>
+          <ul>
+            <li>cos/sin tables for &theta; base 500,000 are precomputed on the GPU at load.</li>
+            <li><code>rope_apply</code> uses one block per (head, position) and one thread per rotation pair <i>(i, i + 64)</i>, applied in place to Q and K.</li>
+            <li>Embedding lookup uses one block per token, with a strided, coalesced row copy. Residual add is a single element-wise kernel.</li>
+          </ul>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= BENCHMARKS ================= -->
+  <section id="benchmarks">
+    <div class="wrap">
+      <span class="label">04 &middot; Benchmarks</span>
+      <h2>Where the time goes</h2>
+      <p class="section-intro">All figures below come from the profiling reports in the repo (<code>docs.md</code>). Placeholders marked <b>TODO</b> are measurements the repo does not yet record.</p>
+
+      <div class="card chart-card" style="margin-top:24px">
+        <h3>GPU time by kernel, one full forward pass</h3>
+        <p class="chart-sub">Share of total kernel time from Nsight Systems, at three sequence lengths <i>s</i></p>
+        <ul class="legend" id="share-legend"></ul>
+        <div class="chart" id="share-chart" role="img" aria-label="Stacked bars showing kernel time share. SGEMM falls from 88.8% at s=25 to 83.7% at s=234, while attention kernels grow from 10.5% to 14.8%."></div>
+        <details class="table-view">
+          <summary>Show the full table</summary>
+          <div class="table-scroll"><table id="share-table"></table></div>
+        </details>
+        <p class="callout">SGEMM dominates at every length because <i>s</i> &ll; <i>d</i>. The attention <code>score</code> and <code>output</code> kernels are the ones whose share grows with <i>s</i>: attention is <i>O(s&sup2;)</i> while the projections are <i>O(s&middot;d&sup2;)</i>. Without a KV cache, attention becomes the bottleneck as sequences get longer.</p>
+      </div>
+
+      <div class="card chart-card" style="margin-top:18px">
+        <h3>Roofline position, measured</h3>
+        <p class="chart-sub">Nsight Compute, both axes log-scaled: RMSNorm at <i>s</i>&nbsp;=&nbsp;<i>d</i>&nbsp;=&nbsp;4096, register-tiled SGEMM at 4096&sup3;</p>
+        <ul class="legend" id="roof-legend"></ul>
+        <div class="chart" id="roof-chart" role="img" aria-label="Log-log roofline scatter. RMSNorm: 0.345 FLOPs per byte at 108 GFLOP/s. SGEMM: 30.05 FLOPs per byte at 4.96 TFLOP/s."></div>
+        <p class="chart-sub" style="margin-top:10px"><b>TODO</b>: draw the bandwidth and peak-compute roofs. The repo does not record peak FLOP/s or HBM bandwidth for the profiled GPU.</p>
+      </div>
+
+      <div class="metrics">
+        <div class="card">
+          <span class="label">RMSNorm &middot; s = d = 4096</span>
+          <ul class="metric-list">
+            <li><span>Predicted AI (ideal)</span><b>1/3 FLOP/B</b></li>
+            <li><span>Measured AI</span><b>0.345 FLOP/B</b></li>
+            <li><span>Kernel time</span><b>629.66 &micro;s</b></li>
+            <li><span>Throughput</span><b>~108 GFLOP/s</b></li>
+            <li><span>DRAM bandwidth</span><b>~314 GB/s</b></li>
+            <li><span>Verdict</span><b>Memory-bound</b></li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="label">SGEMM &middot; 4096 &times; 4096 &times; 4096</span>
+          <ul class="metric-list">
+            <li><span>Predicted AI (per tile)</span><b>8 FLOP/B</b></li>
+            <li><span>Measured AI</span><b>30.05 FLOP/B</b></li>
+            <li><span>Kernel time</span><b>27.73 ms</b></li>
+            <li><span>Throughput</span><b>~4.96 TFLOP/s</b></li>
+            <li><span>DRAM bandwidth</span><b>~165 GB/s</b></li>
+            <li><span>Verdict</span><b>Compute-leaning</b></li>
+          </ul>
+        </div>
+      </div>
+      <p class="callout">Measured arithmetic intensity beats the tile-level estimate for SGEMM (30 vs 8 FLOP/B) because cache hits keep DRAM traffic below the model's assumption. RMSNorm lands almost exactly on its predicted 1/3 FLOP/B.</p>
+
+      <h3 style="margin-top:40px">Still to measure</h3>
+      <div class="grid-2" style="margin-top:12px">
+        <div class="todo">
+          <span class="badge">TODO</span>
+          <h3>End-to-end tokens / second</h3>
+          <p><code>main.cpp</code> prints load, tokenization and generation times for an 8-token run, but no recorded run is in the repo. Add the measured tokens/sec, the GPU it ran on, and the prompt length.</p>
+        </div>
+        <div class="todo">
+          <span class="badge">TODO</span>
+          <h3>SGEMM variant sweep</h3>
+          <p><code>make run_benchmarks</code> times naive, tiled and register-tiled SGEMM at sizes 128 to 4096 (ms and GFLOPS), but its output is not committed. Paste the results here as a line chart of GFLOPS against size.</p>
+        </div>
+        <div class="todo">
+          <span class="badge">TODO</span>
+          <h3>RMSNorm kernel timings</h3>
+          <p><code>benchmarks/benchmark_rmsnorm.cu</code> exists, but no timings are recorded beyond the single NCU run above.</p>
+        </div>
+        <div class="todo">
+          <span class="badge">TODO</span>
+          <h3>Comparison against a baseline</h3>
+          <p>There is no head-to-head against PyTorch / cuBLAS or another engine in the repo yet, for either per-kernel time or end-to-end throughput.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ANALYSIS ================= -->
+  <section id="analysis">
+    <div class="wrap">
+      <span class="label">05 &middot; From the reports</span>
+      <h2>Back-of-envelope numbers</h2>
+      <div class="grid-3" style="margin-top:12px">
+        <div class="card">
+          <span class="label">Score matrices</span>
+          <p>All 32 attention score matrices at <i>s</i>&nbsp;=&nbsp;512 in FP32 take <b>32&nbsp;MB</b>. They grow as 128<i>s&sup2;</i> bytes and would exceed the entire model's weights beyond <i>s</i>&nbsp;&asymp;&nbsp;15,841.</p>
+        </div>
+        <div class="card">
+          <span class="label">QKV and L2</span>
+          <p>Q, K and V are three launches that read the same <i>X<sub>norm</sub></i>. On a 48&nbsp;MB L2 (the course cluster's L4), <i>X<sub>norm</sub></i> fits for <i>s</i>&nbsp;&le;&nbsp;~2,930, which would save 66.7% of that read traffic. A 3&nbsp;MB laptop L2 fits only ~183 tokens.</p>
+        </div>
+        <div class="card">
+          <span class="label">Without a KV cache</span>
+          <p>Generating <i>T</i> tokens from a prompt of length <i>s<sub>0</sub></i> costs &Sigma;&nbsp;<i>F(s<sub>0</sub>&nbsp;+&nbsp;t)</i>, which is <i>O(T&sup2;)</i>. Caching K and V makes each step's work constant, so the total is <i>O(T)</i>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Bare-metal Llama 3 &middot; Harvard CS 265</span>
+    <span><a href="https://github.com/thedylone/baremetal-llama3">Source on GitHub</a> &nbsp;&middot;&nbsp; <a href="https://projects.thedylone.com/">More projects</a></span>
+  </div>
+</footer>
+
+<script src="charts.js"></script>
+</body>
+</html>
