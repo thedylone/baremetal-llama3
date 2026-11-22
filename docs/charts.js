@@ -4,12 +4,13 @@
   "use strict";
   var NS = "http://www.w3.org/2000/svg";
   var css = getComputedStyle(document.documentElement);
+  function tok(name, fb) { return css.getPropertyValue(name).trim() || fb; }
   var C = {
-    gemm: css.getPropertyValue("--s-gemm").trim() || "#3559a0",
-    attn: css.getPropertyValue("--s-attn").trim() || "#b8860b",
-    other: css.getPropertyValue("--s-other").trim() || "#c2410c",
-    grid: "rgba(15,23,42,0.10)",
-    surface: "#f9f9f6",
+    gemm: tok("--series-1", "#1e2f4d"),
+    attn: tok("--series-2", "#b8860b"),
+    other: tok("--series-3", "#4f7cac"),
+    grid: tok("--color-hairline", "rgba(15,23,42,0.12)"),
+    surface: tok("--color-bg", "#f9f9f6"),
   };
 
   function el(name, attrs, parent) {
@@ -120,7 +121,7 @@
 
     S.forEach(function (s, i) {
       var y = padT + i * (barH + gap);
-      txt(svg, padL - 10, y + barH / 2 + 4, "s = " + s, { "text-anchor": "end", class: "ink" });
+      txt(svg, padL - 10, y + barH / 2 + 4, "s = " + s, { "text-anchor": "end", class: "val" });
       var acc = 0;
       GROUPS.forEach(function (g, gi) {
         var members = KERNELS.filter(function (k) { return k.group === g.key; });
@@ -144,7 +145,7 @@
         }).join("");
         var html = '<b><span class="sw" style="background:' + g.color + '"></span>' + g.label +
           "</b><div>s = " + s + " &middot; " + val.toFixed(1) + "% of GPU time</div>" +
-          (members.length > 1 ? '<div style="color:#5b6474;margin-top:4px">' + detail + "</div>" : "");
+          (members.length > 1 ? '<div class="dim" style="margin-top:4px">' + detail + "</div>" : "");
         // generous hit target
         var hit = el("rect", { x: x0, y: y - 6, width: Math.max(10, x1 - x0), height: barH + 12, fill: "transparent" }, svg);
         [p, hit].forEach(function (n) {
@@ -200,7 +201,7 @@
       var hit = el("circle", { cx: cx, cy: cy, r: 16, fill: "transparent" }, svg);
       var perf = p.gflops >= 1000 ? (p.gflops / 1000).toFixed(2) + " TFLOP/s" : p.gflops + " GFLOP/s";
       var html = '<b><span class="sw" style="background:' + p.color + '"></span>' + p.name + "</b><div>" +
-        p.ai + " FLOP/B &middot; " + perf + '</div><div style="color:#5b6474">' + p.note + "</div>";
+        p.ai + " FLOP/B &middot; " + perf + '</div><div class="dim">' + p.note + "</div>";
       [dot, hit].forEach(function (n) {
         n.addEventListener("mousemove", function (e) { tip.show(html, e); });
         n.addEventListener("mouseleave", tip.hide);
