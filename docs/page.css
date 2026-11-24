@@ -1,0 +1,152 @@
+/* Page-specific styles for Bare-Metal Llama 3. Loaded after project-kit.css.
+   Only layout helpers and chart/diagram pieces; header, footer, hero and the
+   type scale come from the kit. */
+
+body { overflow-x: hidden; }
+
+/* stats row */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1.5rem;
+  margin-top: 2.5rem;
+}
+.stats .pk-label { display: block; margin-top: 0.25rem; }
+
+/* fixed-column grids */
+.cols-2, .cols-4 { display: grid; gap: 1.5rem; }
+.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.pk-card { min-width: 0; }
+.pk-card .pk-label { display: block; margin-bottom: 0.5rem; }
+.pk-card > .pk-h3 + * { margin-top: 0.6rem; }
+.pk-card ul { color: var(--color-text-muted); }
+.span-2 { grid-column: 1 / -1; }
+
+/* pipeline step number */
+.step-num {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  color: var(--color-gold);
+  margin-bottom: 0.35rem;
+}
+.cols-4 .pk-card p { font-size: 0.93rem; color: var(--color-text-muted); }
+
+/* one decoder layer as a kernel sequence */
+.layer-ops {
+  list-style: none;
+  padding: 0;
+  margin: 0.75rem 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.3rem;
+  align-items: center;
+}
+.layer-ops li + li { margin-top: 0; }
+.layer-ops li {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-control);
+  background: #fff;
+}
+.layer-ops li.arrow { border: 0; background: none; padding: 0 0.1rem; color: var(--color-gold); }
+.layer-ops li.k-gemm { border-color: var(--series-1); }
+.layer-ops li.k-attn { border-color: var(--series-2); }
+
+/* kernel cards */
+.kernel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+.kernel-head .pk-label { margin: 0; }
+.variants { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.25rem; margin-top: 1rem; }
+.pk-card pre { margin-top: 1rem; font-size: 0.8rem; }
+
+/* charts */
+.chart-head p { margin-top: 0.35rem; }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+  list-style: none;
+  margin: 0.9rem 0 0.6rem;
+  padding: 0;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+}
+.legend li + li { margin-top: 0; }
+.legend li { display: inline-flex; align-items: center; gap: 0.45rem; }
+.legend i { width: 0.75rem; height: 0.75rem; border-radius: 3px; display: inline-block; }
+.chart { position: relative; width: 100%; }
+.chart svg { width: 100%; height: auto; overflow: visible; }
+.chart svg text { font-family: var(--font-mono); font-size: 11px; fill: var(--color-text-muted); }
+.chart svg text.val { fill: var(--color-text); font-weight: 500; }
+.tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: #fff;
+  border: 1px solid var(--color-card-border);
+  border-radius: var(--radius-control);
+  padding: 0.5rem 0.65rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  box-shadow: 0 6px 18px -8px rgba(15, 23, 42, 0.3);
+  opacity: 0;
+  transition: opacity 0.1s;
+  white-space: nowrap;
+  z-index: 3;
+}
+.tooltip .sw { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 2px; margin-right: 0.4rem; }
+.tooltip .dim { color: var(--color-text-muted); }
+
+details.table-view { margin-top: 1rem; }
+details.table-view summary { cursor: pointer; }
+.pk-card .pk-callout { margin-top: 1.25rem; }
+
+/* metric lists */
+.metric-list { list-style: none; padding: 0; margin: 0; }
+.metric-list li + li { margin-top: 0; }
+.metric-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--color-hairline);
+  font-size: 0.93rem;
+}
+.metric-list li:last-child { border-bottom: 0; }
+.metric-list span { color: var(--color-text-muted); }
+.metric-list b { font-weight: 500; font-family: var(--font-mono); font-size: 0.86rem; text-align: right; }
+
+/* TODO placeholders */
+.todo { border-style: dashed; border-color: var(--color-gold-line); }
+.todo-badge {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: var(--color-gold-soft);
+  color: var(--color-navy);
+  border: 1px solid var(--color-gold-line);
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  margin-bottom: 0.6rem;
+}
+.todo p { font-size: 0.93rem; color: var(--color-text-muted); margin-top: 0.4rem; }
+
+@media (max-width: 960px) {
+  .cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  .cols-2, .cols-4, .variants { grid-template-columns: minmax(0, 1fr); }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
+}
